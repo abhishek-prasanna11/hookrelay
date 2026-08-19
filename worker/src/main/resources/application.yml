@@ -1,0 +1,58 @@
+spring:
+  application:
+    name: hookrelay-worker
+
+  main:
+    # No web server: the worker is background I/O-bound work, not a request handler.
+    web-application-type: none
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/hookrelay
+    username: hookrelay
+    password: hookrelay
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+
+  flyway:
+    # The API owns the schema. The worker validates its mappings against whatever the API migrated
+    # and refuses to start if they disagree, but never applies migrations itself — two services
+    # racing to migrate the same database is a deadlock waiting for a deploy.
+    enabled: false
+
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+    listener:
+      simple:
+        # The broker holds each message as unacknowledged until the worker says otherwise, so a
+        # crash mid-delivery means redelivery rather than loss. Automatic acknowledgement would
+        # consider a message delivered the moment it hit the socket.
+        acknowledge-mode: manual
+        # Deliberately small. Delivery is slow, I/O-bound work; a large prefetch just lets one
+        # worker hoard a backlog while other replicas idle, which would undermine the queue-depth
+        # autoscaling in phase 8.
+        prefetch: 8
+        concurrency: 4
+        max-concurrency: 8
+
+hookrelay:
+  delivery:
+    connect-timeout-ms: 5000
+    # Total budget for the whole exchange. Java's HttpClient has no separate socket-read timeout,
+    # so this is what bounds an endpoint that trickles one byte at a time.
+    request-timeout-ms: 15000
+    # Matches the CHECK constraint on delivery_attempts.response_body.
+    max-response-bytes: 512
+    user-agent: HookRelay/0.1
+
+# No management server yet: with no web application there is nothing to serve /actuator/health on.
+# Phase 7 adds one, because Kubernetes liveness and readiness probes need an HTTP endpoint.
+
+logging:
+  level:
+    com.abhishek.hookrelay: INFO

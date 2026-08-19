@@ -1,0 +1,138 @@
+package com.abhishek.hookrelay.worker.delivery;
+
+import com.abhishek.hookrelay.common.domain.Delivery;
+import com.abhishek.hookrelay.common.domain.DeliveryStatus;
+import com.abhishek.hookrelay.common.domain.Endpoint;
+import com.abhishek.hookrelay.common.domain.Event;
+import com.abhishek.hookrelay.common.repo.DeliveryRepository;
+import com.abhishek.hookrelay.common.repo.EndpointRepository;
+import com.abhishek.hookrelay.common.repo.EventRepository;
+import com.abhishek.hookrelay.common.webhook.WebhookEnvelope;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+import java.nio.charset.StandardCharsets;
+import java.time.OffsetDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Optional;
+import java.util.UUID;
+
+/**
+ * Processes one delivery: claim, load, sign, send, record.
+ *
+ * <p>The order is load-bearing. Nothing is acknowledged to the broker until the outcome is committed
+ * to PostgreSQL, so a worker that dies at any point leaves the message unacknowledged and it is
+ * redelivered rather than lost.
+ */
+@Component
+public class DeliveryProcessor {
+
+    private static final Logger log = LoggerFactory.getLogger(DeliveryProcessor.class);
+
+    private final DeliveryRepository deliveries;
+    private final EndpointRepository endpoints;
+    private final EventRepository events;
+    private final DeliveryStore store;
+    private final WebhookSender sender;
+    private final ObjectMapper objectMapper;
+
+    public DeliveryProcessor(DeliveryRepository deliveries,
+                             EndpointRepository endpoints,
+                             EventRepository events,
+                             DeliveryStore store,
+                             WebhookSender sender,
+                             ObjectMapper objectMapper) {
+        this.deliveries = deliveries;
+        this.endpoints = endpoints;
+        this.events = events;
+        this.store = store;
+        this.sender = sender;
+        this.objectMapper = objectMapper;
+    }
+
+    /**
+     * @return the outcome, or empty when there was nothing to do — the delivery had already
+     *         succeeded, or its delivery/endpoint/event rows are gone. Either way the caller
+     *         acknowledges: redelivering would not change the answer.
+     */
+    public Optional<AttemptOutcome> process(UUID deliveryId) {
+        // Claiming is what makes a redelivered message safe. An empty result means another worker
+        // already completed this delivery — most likely one that died between the customer's 200
+        // and its acknowledgement, which is a window that cannot be closed, only handled.
+        Optional<Integer> claimed = store.claimAttempt(deliveryId);
+        if (claimed.isEmpty()) {
+            log.debug("delivery {} already succeeded or missing, skipping", deliveryId);
+            return Optional.empty();
+        }
+        int attemptNo = claimed.get();
+
+        Delivery delivery = deliveries.findById(deliveryId).orElse(null);
+        if (delivery == null) {
+            log.warn("delivery {} vanished after claim", deliveryId);
+            return Optional.empty();
+        }
+
+        Endpoint endpoint = endpoints.findById(delivery.getEndpointId()).orElse(null);
+        Event event = events.findById(delivery.getEventId()).orElse(null);
+        if (endpoint == null || event == null) {
+            store.markDeadWithoutAttempt(deliveryId,
+                    endpoint == null ? "endpoint no longer exists" : "event no longer exists");
+            return Optional.empty();
+        }
+
+        byte[] body;
+        try {
+            body = serializeEnvelope(delivery, event);
+        } catch (JsonProcessingException e) {
+            log.error("could not serialize envelope for delivery {}", deliveryId, e);
+            store.markDeadWithoutAttempt(deliveryId, "envelope serialization failed");
+            return Optional.empty();
+        }
+
+        OffsetDateTime startedAt = OffsetDateTime.now();
+        AttemptOutcome outcome = sender.send(
+                endpoint.getUrl(), endpoint.getSecret(), body,
+                delivery.getId(), event.getId(), event.getEventType(), attemptNo);
+
+        store.recordAttempt(deliveryId, attemptNo, startedAt, outcome, statusFor(outcome));
+
+        log.debug("delivery {} attempt {} -> {} ({}ms)",
+                deliveryId, attemptNo, outcome.classification(), outcome.durationMs());
+        return Optional.of(outcome);
+    }
+
+    /**
+     * Serializes the body exactly once. These bytes are both what gets signed and what gets written
+     * to the socket — signing one serialization and transmitting another produces signatures that
+     * fail at the customer while looking like a key problem. The risk is real here because the
+     * payload round-trips through {@code jsonb}, which reorders keys and strips whitespace.
+     */
+    private byte[] serializeEnvelope(Delivery delivery, Event event) throws JsonProcessingException {
+        WebhookEnvelope envelope = new WebhookEnvelope(
+                delivery.getId(),
+                event.getId(),
+                event.getEventType(),
+                event.getCreatedAt().format(DateTimeFormatter.ISO_OFFSET_DATE_TIME),
+                event.getPayload());
+        return objectMapper.writeValueAsString(envelope).getBytes(StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Maps an outcome to a delivery status.
+     *
+     * <p>In this phase {@code FAILED} means "attempted, failed, not retried <em>yet</em>" — there is
+     * no retry infrastructure until phase 4, which replaces the acknowledgement of a retryable
+     * failure with a publish to a delay queue. {@code FAILED} is therefore not terminal, despite
+     * currently being where a retryable failure stops.
+     */
+    private static DeliveryStatus statusFor(AttemptOutcome outcome) {
+        return switch (outcome.classification()) {
+            case SUCCESS -> DeliveryStatus.SUCCEEDED;
+            case RETRYABLE -> DeliveryStatus.FAILED;
+            case PERMANENT -> DeliveryStatus.DEAD;
+        };
+    }
+}
