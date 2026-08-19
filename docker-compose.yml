@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: hookrelay-postgres
+    environment:
+      POSTGRES_DB: hookrelay
+      POSTGRES_USER: hookrelay
+      POSTGRES_PASSWORD: hookrelay
+    ports:
+      - "5432:5432"
+    volumes:
+      - hookrelay-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hookrelay -d hookrelay"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: hookrelay-rabbitmq
+    ports:
+      - "5672:5672"     # AMQP
+      - "15672:15672"   # management UI, guest/guest
+    volumes:
+      - hookrelay-rabbitdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  hookrelay-pgdata:
+  hookrelay-rabbitdata:

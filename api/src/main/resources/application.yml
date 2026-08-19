@@ -1,0 +1,84 @@
+spring:
+  application:
+    name: hookrelay-api
+
+  datasource:
+    # reWriteBatchedInserts collapses a batch of INSERTs into a single multi-row statement, which
+    # matters because fan-out writes one delivery row per matching endpoint inside the request.
+    url: jdbc:postgresql://localhost:5432/hookrelay?reWriteBatchedInserts=true
+    username: hookrelay
+    password: hookrelay
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      # Flyway owns the schema. Hibernate only checks that the entity mappings agree with it and
+      # refuses to start if they do not; it never issues DDL.
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 50
+        order_inserts: true
+        order_updates: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  jackson:
+    # The wire format is snake_case (event_type, deliveries_created) while Java stays camelCase.
+    property-naming-strategy: SNAKE_CASE
+    # Omits nulls, so EndpointResponse.secret simply disappears on reads instead of serializing as
+    # "secret": null on every endpoint fetch.
+    default-property-inclusion: non_null
+
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+    # SIMPLE confirms let the publisher block on waitForConfirms for a whole batch on one channel.
+    # Without confirms of some kind, publishing is fire-and-forget: it "succeeds" even when the
+    # broker is already dead and the bytes only reached a TCP buffer.
+    publisher-confirm-type: simple
+    # Needed for the mandatory flag to produce a return instead of a silent discard when a message
+    # is unroutable.
+    publisher-returns: true
+
+server:
+  port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+hookrelay:
+  ingest:
+    # Rejected with 422 above this size. Keeps a single event from monopolising memory and from
+    # producing a webhook body no receiver will accept.
+    max-payload-bytes: 262144
+
+  outbox:
+    publisher:
+      # Gate rather than a hard-coded decision: running this same image with the flag off in the
+      # API and on elsewhere is all it takes to give the publisher its own Deployment later.
+      enabled: true
+      poll-interval-ms: 200
+      # Bounds how many rows are row-locked at once while we wait on the broker.
+      batch-size: 100
+      confirm-timeout-ms: 5000
+    purge:
+      enabled: true
+      retention-hours: 24
+      interval-ms: 3600000
+
+logging:
+  level:
+    com.abhishek.hookrelay: INFO
