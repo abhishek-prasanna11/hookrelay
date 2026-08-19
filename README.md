@@ -4,9 +4,9 @@ A webhook delivery platform. You hand it an event once; it guarantees the event 
 subscribed HTTP endpoint — surviving worker crashes, dead destinations, slow destinations,
 duplicate submissions, its own redeployments, and traffic spikes.
 
-**Status: phases 1–3 of 10 complete.** Ingest API, durable event store, transactional outbox,
-RabbitMQ publishing, and a worker performing real signed HTTP delivery are built and tested.
-Retries, the DLQ and endpoint isolation start in phase 4.
+**Status: phases 1–4 of 10 complete.** Ingest API, durable event store, transactional outbox,
+RabbitMQ publishing, a worker performing real signed HTTP delivery, and bounded exponential retries
+with a dead-letter queue are built and tested. Endpoint isolation starts in phase 5.
 
 ---
 
@@ -70,7 +70,8 @@ on queue depth.
   Ordering and retries are mutually exclusive; ordering is the explicit non-goal.
 - **Durable before acknowledged.** `202 Accepted` is returned only after the transaction commits.
   If the API says 202, a power cut cannot erase the event.
-- **Bounded retry.** 8 attempts with exponential backoff and ±20% jitter, then the dead-letter queue.
+- **Bounded retry.** 8 attempts with exponential backoff and ±20% jitter over ~4h 42m, then the
+  dead-letter queue with the reason attached. Retrying forever is a capacity leak, not persistence.
 
 ---
 
@@ -102,6 +103,12 @@ and receiver-side deduplication precisely so the second failure is survivable.
 several API replicas can drain in parallel — no leader election, no distributed lock. 4 concurrent
 pollers over 20 rows produce 20 messages and 0 duplicates.
 
+**One delay queue per backoff tier, not one shared queue.** RabbitMQ only inspects the message at
+the *head* of a queue for expiry, so in a shared delay queue a 3-hour retry blocks every 5-second
+retry behind it. Measured: a 400 ms retry stuck behind a 6000 ms one came out at **6024 ms**
+(15.1× overshoot); with per-tier queues, **405 ms**. Jitter reintroduces blocking *within* a tier,
+bounded by the jitter spread — measured at 407 ms against a predicted 400 ms.
+
 **UUIDv7 primary keys.** `deliveries.id` is public, so it cannot be a sequential integer — but
 random UUIDv4 scatters inserts across the B-tree and splits pages constantly. v7 embeds a
 millisecond timestamp, so inserts append to the index's right edge while staying unguessable.
@@ -112,7 +119,7 @@ millisecond timestamp, so inserts append to the index's right edge while staying
 
 | Result | Value |
 |---|---|
-| Test suite | 82 tests, 0 failures |
+| Test suite | 105 tests, 0 failures |
 | Duplicate events under 20 concurrent identical submissions — app-level check | **16** |
 | Duplicate events under 20 concurrent identical submissions — DB constraint | **1** |
 | Deliveries lost to a crash between commit and publish — direct publish | **10 of 10** |
@@ -121,6 +128,9 @@ millisecond timestamp, so inserts append to the index's right edge while staying
 | Duplicate HTTP calls from a crash *after* the commit, before the ack | **0 of 10** |
 | Duplicate HTTP calls from a crash *before* the commit | **10 of 10** — why the delivery-id contract exists |
 | Deliveries lost to a worker crash, either window | **0** |
+| Short retry stuck behind a long one — one shared delay queue | **6024 ms** (nominal 400 ms) |
+| Short retry — one queue per backoff tier | **405 ms** |
+| Head-of-line blocking within a tier vs predicted jitter bound | **407 ms** vs 400 ms |
 
 Full detail, with commands to reproduce: [RESULTS.md](RESULTS.md).
 
@@ -156,7 +166,7 @@ no local database or broker is needed. Full command reference: [REFERENCE.md](RE
 | 1 | Ingest API + PostgreSQL | done |
 | 2 | Outbox + RabbitMQ | done |
 | 3 | Worker + delivery | done |
-| 4 | Retry + DLQ | |
+| 4 | Retry + DLQ | done |
 | 5 | Isolation + security | |
 | 6 | Observability | |
 | 7 | Docker + Kubernetes | |

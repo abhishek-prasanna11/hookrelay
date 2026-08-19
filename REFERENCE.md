@@ -1,6 +1,6 @@
 # HookRelay — Reference
 
-Current as of **phase 3**. Sections for the Kubernetes topology arrive with the phases that build
+Current as of **phase 4**. Sections for the Kubernetes topology arrive with the phases that build
 them.
 
 ---
@@ -153,8 +153,70 @@ Liveness and readiness probes are enabled at `/actuator/health/liveness` and
    └──────────────────────┘
 ```
 
-Declared by both the API and the worker so either can start first. Retry queues and the DLQ arrive
-in phase 4.
+Declared by both the API and the worker so either can start first.
+
+### Retry tiers and the dead-letter queue
+
+```text
+   a retryable failure                        attempts exhausted, or
+             │                                a permanent failure
+             ▼                                          │
+   ┌──────────────────────┐                             ▼
+   │ exchange:            │                ┌──────────────────────┐
+   │   hookrelay.retry    │                │ exchange:            │
+   └──────────┬───────────┘                │   hookrelay.dlq      │
+              │ routing key = tier name    └──────────┬───────────┘
+              ▼                                       ▼
+   retry.5s  retry.30s  retry.2m  retry.10m  ┌──────────────────────┐
+   retry.30m retry.1h   retry.3h             │ queue:               │
+              │                              │   deliveries.dlq     │
+              │ no consumers; on TTL expiry  │ terminal: no TTL,    │
+              │ the queue's dead-letter      │ no DLX, no consumer  │
+              └──► hookrelay ──► deliveries  └──────────────────────┘
+```
+
+Each tier queue has no consumer, `x-dead-letter-exchange = hookrelay`,
+`x-dead-letter-routing-key = delivery`, and `x-message-ttl` at the top of its jitter range as a
+backstop. The per-message `expiration` carries the jittered delay and normally decides, since
+RabbitMQ honours whichever is lower.
+
+**One queue per tier, not one shared delay queue.** RabbitMQ only inspects the message at the head
+of a queue for expiry, so a shared queue lets a 3-hour retry block every 5-second retry behind it —
+measured at a 15.1× overshoot in [RESULTS.md](RESULTS.md#42-how-bad-is-head-of-line-blocking-really).
+
+### The retry schedule
+
+| Completed attempt | Next | Nominal delay | Tier |
+|---:|---:|---|---|
+| 1 | 2 | 5s | `retry.5s` |
+| 2 | 3 | 30s | `retry.30s` |
+| 3 | 4 | 2m | `retry.2m` |
+| 4 | 5 | 10m | `retry.10m` |
+| 5 | 6 | 30m | `retry.30m` |
+| 6 | 7 | 1h | `retry.1h` |
+| 7 | 8 | 3h | `retry.3h` |
+| 8 | — | — | dead-lettered |
+
+Every delay is multiplied by a uniform random factor in `[0.8, 1.2]`. Total window ≈ 4h 42m.
+
+Jitter exists because an endpoint going down fails every delivery to it within the same second —
+without it, all of them would retry in the *same* second, aimed at a service that was just
+recovering.
+
+### Reading the dead-letter queue
+
+The message body is the usual claim check; the reason rides along as headers, so the queue explains
+itself in the management UI without a database lookup.
+
+| Header | Values |
+|---|---|
+| `x-hookrelay-reason` | `attempts_exhausted` · `permanent_failure` |
+| `x-hookrelay-attempts` | attempts made |
+| `x-hookrelay-last-error` | `HTTP 500` · `TIMEOUT` · `DNS` … |
+| `x-hookrelay-endpoint-id` | the endpoint's UUID |
+| `x-hookrelay-failed-at` | ISO-8601 |
+
+Redrive is deliberately out of scope (BLUEPRINT.md §32).
 
 Message body is a claim check — the delivery id only, not the payload:
 
@@ -241,8 +303,8 @@ python3 tools/webhook_receiver.py --selftest
 redirect would let a customer register a public URL and redirect to an internal address, stepping
 around the SSRF checks that arrive in phase 5.
 
-**In phase 3 `FAILED` is not yet terminal and not yet retried** — the message is acknowledged and
-the delivery stops. Phase 4 replaces that acknowledgement with a publish to a delay queue.
+`FAILED` means "attempted, failed, retry scheduled" — the delivery is on a tier queue and
+`next_attempt_at` says roughly when it will fire. `SUCCEEDED` and `DEAD` are terminal.
 
 ---
 
@@ -275,6 +337,10 @@ new numbered migration.
 | `deliveries` | One obligation per event × matching endpoint. `id` is the public delivery id. |
 | `delivery_attempts` | Append-only audit trail, one row per HTTP attempt. |
 | `outbox_events` | Committed intent to publish. Partial index covers unpublished rows only. |
+
+`deliveries.next_attempt_at` is **observability, not a scheduler**. The retry schedule lives in
+RabbitMQ's delay queues; nothing polls this column, and nothing should, or the database and the
+broker would race to retry the same delivery.
 
 Constraints that encode a rule rather than trusting code:
 

@@ -7,6 +7,8 @@ import com.abhishek.hookrelay.common.domain.Event;
 import com.abhishek.hookrelay.common.repo.DeliveryRepository;
 import com.abhishek.hookrelay.common.repo.EndpointRepository;
 import com.abhishek.hookrelay.common.repo.EventRepository;
+import com.abhishek.hookrelay.common.retry.RetryPolicy;
+import com.abhishek.hookrelay.common.retry.RetryTier;
 import com.abhishek.hookrelay.common.webhook.WebhookEnvelope;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -15,6 +17,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Optional;
@@ -37,6 +40,7 @@ public class DeliveryProcessor {
     private final EventRepository events;
     private final DeliveryStore store;
     private final WebhookSender sender;
+    private final RetryPublisher retries;
     private final ObjectMapper objectMapper;
 
     public DeliveryProcessor(DeliveryRepository deliveries,
@@ -44,12 +48,14 @@ public class DeliveryProcessor {
                              EventRepository events,
                              DeliveryStore store,
                              WebhookSender sender,
+                             RetryPublisher retries,
                              ObjectMapper objectMapper) {
         this.deliveries = deliveries;
         this.endpoints = endpoints;
         this.events = events;
         this.store = store;
         this.sender = sender;
+        this.retries = retries;
         this.objectMapper = objectMapper;
     }
 
@@ -97,11 +103,59 @@ public class DeliveryProcessor {
                 endpoint.getUrl(), endpoint.getSecret(), body,
                 delivery.getId(), event.getId(), event.getEventType(), attemptNo);
 
-        store.recordAttempt(deliveryId, attemptNo, startedAt, outcome, statusFor(outcome));
+        route(deliveryId, endpoint.getId(), attemptNo, startedAt, outcome);
 
         log.debug("delivery {} attempt {} -> {} ({}ms)",
                 deliveryId, attemptNo, outcome.classification(), outcome.durationMs());
         return Optional.of(outcome);
+    }
+
+    /**
+     * Decides what happens to the delivery next, and records it.
+     *
+     * <pre>
+     *   SUCCESS            → SUCCEEDED, nothing queued
+     *   PERMANENT          → DEAD, dead-lettered
+     *   RETRYABLE, tier    → FAILED, scheduled on that tier
+     *   RETRYABLE, no tier → DEAD, dead-lettered (attempts exhausted)
+     * </pre>
+     *
+     * <p>The publish happens before the caller acknowledges the original message, so a crash in
+     * between duplicates a retry rather than abandoning the delivery.
+     */
+    private void route(UUID deliveryId, UUID endpointId, int attemptNo,
+                       OffsetDateTime startedAt, AttemptOutcome outcome) {
+        if (outcome.succeeded()) {
+            store.recordAttempt(deliveryId, attemptNo, startedAt, outcome,
+                    DeliveryStatus.SUCCEEDED, null);
+            return;
+        }
+
+        if (outcome.classification() == AttemptOutcome.Classification.PERMANENT) {
+            store.recordAttempt(deliveryId, attemptNo, startedAt, outcome, DeliveryStatus.DEAD, null);
+            retries.deadLetter(deliveryId, endpointId, RetryPublisher.REASON_PERMANENT_FAILURE,
+                    attemptNo, describe(outcome));
+            return;
+        }
+
+        Optional<RetryTier> tier = RetryPolicy.tierAfter(attemptNo);
+        if (tier.isEmpty()) {
+            store.recordAttempt(deliveryId, attemptNo, startedAt, outcome, DeliveryStatus.DEAD, null);
+            retries.deadLetter(deliveryId, endpointId, RetryPublisher.REASON_ATTEMPTS_EXHAUSTED,
+                    attemptNo, describe(outcome));
+            return;
+        }
+
+        long delayMillis = RetryPolicy.jitteredDelayMillis(tier.get());
+        store.recordAttempt(deliveryId, attemptNo, startedAt, outcome, DeliveryStatus.FAILED,
+                OffsetDateTime.now().plus(Duration.ofMillis(delayMillis)));
+        retries.scheduleRetry(deliveryId, tier.get(), delayMillis);
+    }
+
+    private static String describe(AttemptOutcome outcome) {
+        return outcome.responseStatus() != null
+                ? "HTTP " + outcome.responseStatus()
+                : outcome.errorClass();
     }
 
     /**
@@ -120,19 +174,4 @@ public class DeliveryProcessor {
         return objectMapper.writeValueAsString(envelope).getBytes(StandardCharsets.UTF_8);
     }
 
-    /**
-     * Maps an outcome to a delivery status.
-     *
-     * <p>In this phase {@code FAILED} means "attempted, failed, not retried <em>yet</em>" — there is
-     * no retry infrastructure until phase 4, which replaces the acknowledgement of a retryable
-     * failure with a publish to a delay queue. {@code FAILED} is therefore not terminal, despite
-     * currently being where a retryable failure stops.
-     */
-    private static DeliveryStatus statusFor(AttemptOutcome outcome) {
-        return switch (outcome.classification()) {
-            case SUCCESS -> DeliveryStatus.SUCCEEDED;
-            case RETRYABLE -> DeliveryStatus.FAILED;
-            case PERMANENT -> DeliveryStatus.DEAD;
-        };
-    }
 }

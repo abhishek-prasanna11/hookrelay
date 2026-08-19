@@ -66,7 +66,8 @@ public class DeliveryStore {
      */
     @Transactional
     public void recordAttempt(UUID deliveryId, int attemptNo, OffsetDateTime startedAt,
-                              AttemptOutcome outcome, DeliveryStatus newStatus) {
+                              AttemptOutcome outcome, DeliveryStatus newStatus,
+                              OffsetDateTime nextAttemptAt) {
         jdbc.update("""
                 INSERT INTO delivery_attempts
                     (delivery_id, attempt_no, started_at, duration_ms, response_status, error_class, response_body)
@@ -80,15 +81,20 @@ public class DeliveryStore {
                 outcome.errorClass(),
                 outcome.responseBody());
 
+        // next_attempt_at is written for observability only. The retry schedule itself lives in
+        // RabbitMQ's delay queues — nothing polls this column, and nothing should, or the database
+        // and the broker would race to retry the same delivery.
         jdbc.update("""
                 UPDATE deliveries
                    SET status = ?,
                        last_error = ?,
+                       next_attempt_at = ?,
                        updated_at = now()
                  WHERE id = ?
                 """,
                 newStatus.name(),
                 describeError(outcome),
+                nextAttemptAt,
                 deliveryId);
     }
 

@@ -265,13 +265,83 @@ JAVA_HOME=$(/usr/libexec/java_home -v 21) mvn -pl common,worker -Dtest=DeliveryL
 
 ---
 
+## Phase 4 — Retry, backoff and the DLQ
+
+### 4.1 Test suite
+
+```bash
+JAVA_HOME=$(/usr/libexec/java_home -v 21) mvn test
+```
+
+| Module | Tests | Failures | Errors |
+|---|---:|---:|---:|
+| `hookrelay-common` | 31 | 0 | 0 |
+| `hookrelay-api` | 38 | 0 | 0 |
+| `hookrelay-worker` | 36 | 0 | 0 |
+| **Total** | **105** | **0** | **0** |
+
+---
+
+### 4.2 How bad is head-of-line blocking, really?
+
+**Question.** Exponential backoff needs delays spanning seconds to hours. Does putting them all in
+one RabbitMQ delay queue with per-message TTLs actually break, and by how much?
+
+**Workload.** Publish a long-delay message, then immediately a short-delay one, and measure when the
+short one is released. Two topologies, identical otherwise: one shared delay queue versus one queue
+per delay bucket. Both dead-letter into the same landing queue, whose arrivals are timestamped.
+Nominal delays: long 6000 ms, short 400 ms.
+
+| Measurement | Naive: one shared queue | Tiered: one queue per bucket |
+|---|---:|---:|
+| Short retry's nominal delay | 400 ms | 400 ms |
+| **Short retry's actual delay** | **6024 ms** | **405 ms** |
+| Blocking attributable to the long message | **5624 ms** | **5 ms** |
+| Overshoot factor | **15.1×** | **1.01×** |
+| Long retry's actual delay | 6021 ms | 6007 ms |
+
+**Interpretation.** RabbitMQ only inspects the message at the **head** of a queue for expiry, because
+checking every message would mean scanning the queue continuously. The short retry's TTL elapsed
+after 400 ms, but it could not expire until it reached the head, and it could not reach the head
+until the message ahead of it expired. Its own TTL was irrelevant.
+
+Scaled to the real schedule, whose longest tier is three hours rather than six seconds, one customer
+stuck on the 3h tier would hold every five-second retry behind it for three hours — converting a
+graceful backoff curve into a system where one slow endpoint stalls everyone's retries.
+
+### 4.3 Bounded blocking within a tier
+
+**Question.** Jitter needs per-message TTLs, which reintroduces head-of-line blocking inside a tier.
+How much?
+
+**Workload.** Two messages in the same queue with TTLs at the top and bottom of a 1000 ms tier's
+±20% jitter range, the slower one published first (the worst case).
+
+| Measurement | Value |
+|---|---:|
+| Faster message's nominal delay | 800 ms |
+| Faster message's actual delay | 1207 ms |
+| **Blocking** | **407 ms** |
+| Predicted bound (jitter spread `1200 − 800`) | 400 ms |
+
+**Interpretation.** 407 ms against a predicted 400 ms; the extra 7 ms is broker overhead. Head-of-line
+blocking is **not eliminated** — it is reduced from the full range of the schedule to the width of one
+tier's jitter. On the 5s tier that is about two seconds of skew, against hours for the naive design.
+
+**Reproduce.** `DelayQueueHeadOfLineTest` declares both topologies itself:
+
+```bash
+JAVA_HOME=$(/usr/libexec/java_home -v 21) mvn -pl common,worker -Dtest=DelayQueueHeadOfLineTest -Dsurefire.failIfNoSpecifiedTests=false test
+```
+
+---
+
 ## Not yet measured
 
 Listed so their absence is explicit rather than an oversight.
 
 | Result | Phase |
 |---|---|
-| Retry delay-queue head-of-line blocking, naive vs tiered | 4 |
 | Endpoint isolation: healthy-endpoint p95/p99 with and without the semaphore + breaker | 5 |
 | Rolling deployment under load: dropped requests, lost deliveries | 7 |
 | CPU-based HPA vs KEDA queue-depth scaling | 8 |
