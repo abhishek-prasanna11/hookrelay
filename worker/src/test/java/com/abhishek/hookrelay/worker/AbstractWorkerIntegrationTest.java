@@ -31,6 +31,8 @@ import java.util.UUID;
 @SpringBootTest
 @TestPropertySource(properties = {
         "spring.flyway.enabled=true",
+        // The test receiver runs on loopback, which is exactly what SsrfGuard exists to refuse.
+        "hookrelay.security.allow-private-destinations=true",
         "hookrelay.delivery.connect-timeout-ms=2000",
         "hookrelay.delivery.request-timeout-ms=1500"
 })

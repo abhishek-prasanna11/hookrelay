@@ -42,9 +42,14 @@ public class DeliveryListener {
     @RabbitListener(queues = RabbitTopology.DELIVERIES_QUEUE)
     public void onDelivery(DeliveryMessage message,
                            Channel channel,
-                           @Header(AmqpHeaders.DELIVERY_TAG) long deliveryTag) throws IOException {
+                           @Header(AmqpHeaders.DELIVERY_TAG) long deliveryTag,
+                           @Header(name = RetryPublisher.HEADER_DEFERRALS, required = false)
+                           Integer deferrals) throws IOException {
         try {
-            processor.process(message.deliveryId());
+            // Deferral count survives the round trip through the deferred queue, because RabbitMQ
+            // preserves headers when it dead-letters a message. It is what bounds the loop for an
+            // endpoint that is permanently at its concurrency limit.
+            processor.process(message.deliveryId(), deferrals == null ? 0 : deferrals);
             channel.basicAck(deliveryTag, false);
         } catch (Exception e) {
             // An unexpected failure here is a bug in the worker, not a failing customer endpoint.

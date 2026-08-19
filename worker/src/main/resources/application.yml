@@ -41,6 +41,11 @@ spring:
         max-concurrency: 8
 
 hookrelay:
+  security:
+    # See the same key in the API's configuration. Both services must agree, or an endpoint the API
+    # accepts would be refused at delivery time (or worse, the reverse).
+    allow-private-destinations: false
+
   delivery:
     connect-timeout-ms: 5000
     # Total budget for the whole exchange. Java's HttpClient has no separate socket-read timeout,
@@ -49,6 +54,20 @@ hookrelay:
     # Matches the CHECK constraint on delivery_attempts.response_body.
     max-response-bytes: 512
     user-agent: HookRelay/0.1
+
+  isolation:
+    # A delivery put back for lack of an endpoint permit does not consume an attempt, so the loop
+    # needs its own bound. 50 deferrals is roughly 100 seconds of waiting, after which it becomes a
+    # CAPACITY failure on the (already bounded) retry ladder.
+    max-deferrals: 50
+
+  circuit-breaker:
+    # Consecutive, not cumulative: an endpoint that fails occasionally and recovers should never
+    # trip. Only an unbroken run indicates it is actually down.
+    failure-threshold: 5
+    # Shorter than the 2-minute gap before attempt 4, so a recovering endpoint is probed while it
+    # still has attempts left.
+    cooldown-ms: 30000
 
 # No management server yet: with no web application there is nothing to serve /actuator/health on.
 # Phase 7 adds one, because Kubernetes liveness and readiness probes need an HTTP endpoint.

@@ -31,6 +31,7 @@ public class RetryPublisher {
     public static final String HEADER_LAST_ERROR = "x-hookrelay-last-error";
     public static final String HEADER_ENDPOINT_ID = "x-hookrelay-endpoint-id";
     public static final String HEADER_FAILED_AT = "x-hookrelay-failed-at";
+    public static final String HEADER_DEFERRALS = "x-hookrelay-deferrals";
 
     public static final String REASON_ATTEMPTS_EXHAUSTED = "attempts_exhausted";
     public static final String REASON_PERMANENT_FAILURE = "permanent_failure";
@@ -55,6 +56,24 @@ public class RetryPublisher {
                     return message;
                 });
         log.debug("delivery {} scheduled on {} in {}ms", deliveryId, tier.queueName(), delayMillis);
+    }
+
+    /**
+     * Puts a delivery back because its endpoint had no free permit.
+     *
+     * <p>Not a retry: nothing was attempted, so this must not consume one of the eight attempts. The
+     * deferral count rides on the message so the loop can be bounded — an endpoint that is
+     * permanently saturated would otherwise cycle forever.
+     */
+    public void defer(UUID deliveryId, int previousDeferrals) {
+        rabbit.convertAndSend(RabbitTopology.RETRY_EXCHANGE, RabbitTopology.DEFERRED_QUEUE,
+                new DeliveryMessage(deliveryId),
+                message -> {
+                    message.getMessageProperties().setDeliveryMode(MessageDeliveryMode.PERSISTENT);
+                    message.getMessageProperties().setHeader(HEADER_DEFERRALS, previousDeferrals + 1);
+                    return message;
+                });
+        log.debug("delivery {} deferred ({} so far)", deliveryId, previousDeferrals + 1);
     }
 
     /**

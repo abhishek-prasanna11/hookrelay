@@ -23,7 +23,7 @@ import java.util.Map;
  */
 public class TestWebhookReceiver implements AutoCloseable {
 
-    public record Received(Map<String, String> headers, byte[] body) {
+    public record Received(Map<String, String> headers, byte[] body, long receivedAtMillis) {
         public String header(String name) {
             return headers.get(name.toLowerCase());
         }
@@ -34,6 +34,8 @@ public class TestWebhookReceiver implements AutoCloseable {
     }
 
     private final HttpServer server;
+    private final java.util.concurrent.ExecutorService executor =
+            java.util.concurrent.Executors.newFixedThreadPool(16);
     private final List<Received> received = Collections.synchronizedList(new ArrayList<>());
 
     private volatile int responseStatus = 200;
@@ -43,6 +45,11 @@ public class TestWebhookReceiver implements AutoCloseable {
 
     public TestWebhookReceiver() throws IOException {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        // An explicit pool, because HttpServer's default executor is SINGLE-THREADED. Left as the
+        // default, a receiver told to delay 2s serialises every request, so a measurement of
+        // "how long did the worker pool stay blocked" would really be measuring the test server's
+        // own concurrency limit.
+        server.setExecutor(executor);
         server.createContext("/hook", this::handle);
         server.createContext("/redirected", exchange -> {
             received.add(readExchange(exchange));
@@ -83,7 +90,7 @@ public class TestWebhookReceiver implements AutoCloseable {
         try (InputStream in = exchange.getRequestBody()) {
             body = in.readAllBytes();
         }
-        return new Received(headers, body);
+        return new Received(headers, body, System.currentTimeMillis());
     }
 
     public String url() {
@@ -134,5 +141,6 @@ public class TestWebhookReceiver implements AutoCloseable {
     @Override
     public void close() {
         server.stop(0);
+        executor.shutdownNow();
     }
 }

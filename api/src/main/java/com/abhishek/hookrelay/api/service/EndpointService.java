@@ -2,18 +2,17 @@ package com.abhishek.hookrelay.api.service;
 
 import com.abhishek.hookrelay.api.error.ApiException;
 import com.abhishek.hookrelay.common.domain.Endpoint;
+import com.abhishek.hookrelay.common.net.DestinationPolicy;
+import com.abhishek.hookrelay.common.net.SsrfGuard;
 import com.abhishek.hookrelay.common.repo.EndpointRepository;
 import com.abhishek.hookrelay.common.util.Uuid7;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.net.URI;
-import java.net.URISyntaxException;
 import java.security.SecureRandom;
 import java.time.OffsetDateTime;
 import java.util.HexFormat;
 import java.util.List;
-import java.util.Locale;
 import java.util.UUID;
 
 @Service
@@ -24,9 +23,11 @@ public class EndpointService {
     private static final int DEFAULT_MAX_CONCURRENCY = 5;
 
     private final EndpointRepository endpoints;
+    private final DestinationPolicy destinations;
 
-    public EndpointService(EndpointRepository endpoints) {
+    public EndpointService(EndpointRepository endpoints, DestinationPolicy destinations) {
         this.endpoints = endpoints;
+        this.destinations = destinations;
     }
 
     @Transactional
@@ -90,29 +91,17 @@ public class EndpointService {
     }
 
     /**
-     * Syntactic validation only. Checking that the destination is not an internal address — the
-     * SSRF problem — belongs at delivery time, after DNS resolution, and arrives in phase 5. A
-     * registration-time check alone would not stop DNS rebinding anyway.
+     * Rejects what can be proven bad at registration time.
+     *
+     * <p>A host that fails to resolve is <em>allowed</em> here: DNS is permitted to be temporarily
+     * broken, and refusing registration for it would make endpoint creation depend on the resolver's
+     * mood. The delivery-time check is the real gate — it runs on a fresh lookup, which is what
+     * defeats an attacker who changes DNS after registering a public address.
      */
-    private static void validateUrl(String url) {
-        if (url == null || url.isBlank()) {
-            throw ApiException.badRequest("missing_url", "url is required");
-        }
-        URI uri;
-        try {
-            uri = new URI(url);
-        } catch (URISyntaxException e) {
-            throw ApiException.badRequest("invalid_url", "url is not a valid URI");
-        }
-        if (!uri.isAbsolute() || uri.getScheme() == null) {
-            throw ApiException.badRequest("invalid_url", "url must be absolute");
-        }
-        String scheme = uri.getScheme().toLowerCase(Locale.ROOT);
-        if (!scheme.equals("http") && !scheme.equals("https")) {
-            throw ApiException.badRequest("invalid_url", "url scheme must be http or https");
-        }
-        if (uri.getHost() == null || uri.getHost().isBlank()) {
-            throw ApiException.badRequest("invalid_url", "url must contain a host");
+    private void validateUrl(String url) {
+        SsrfGuard.Result result = destinations.check(url, true);
+        if (!result.allowed()) {
+            throw ApiException.badRequest("invalid_url", result.reason());
         }
     }
 

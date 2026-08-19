@@ -19,7 +19,7 @@ import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
  */
 @SpringBootApplication(scanBasePackageClasses = {
         HookRelayWorkerApplication.class,
-        com.abhishek.hookrelay.common.messaging.RabbitTopology.class
+        com.abhishek.hookrelay.common.CommonModule.class
 })
 @EntityScan(basePackageClasses = Event.class)
 @EnableJpaRepositories(basePackageClasses = EventRepository.class)

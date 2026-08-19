@@ -41,6 +41,9 @@ import java.util.UUID;
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestPropertySource(properties = {
         "hookrelay.outbox.publisher.enabled=false",
+        // Keeps registration from doing a DNS lookup per test, and lets loopback URLs register.
+        // EndpointSsrfTest turns it back off to prove the guard is wired in.
+        "hookrelay.security.allow-private-destinations=true",
         "hookrelay.outbox.purge.enabled=false",
         "hookrelay.outbox.publisher.confirm-timeout-ms=1500"
 })

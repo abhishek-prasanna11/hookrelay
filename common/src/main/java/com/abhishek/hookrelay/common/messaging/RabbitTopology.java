@@ -68,6 +68,9 @@ public class RabbitTopology {
     public static final String DLQ_QUEUE = "deliveries.dlq";
     public static final String DLQ_ROUTING_KEY = "dead";
 
+    public static final String DEFERRED_QUEUE = "deliveries.deferred";
+    public static final int DEFERRAL_DELAY_MS = 2000;
+
     @Bean
     public DirectExchange hookrelayExchange() {
         return ExchangeBuilder.directExchange(EXCHANGE).durable(true).build();
@@ -117,6 +120,33 @@ public class RabbitTopology {
                     RETRY_EXCHANGE, tier.queueName(), null));
         }
         return new Declarables(declarables);
+    }
+
+    // ---- deferrals ----------------------------------------------------------------------------
+
+    /**
+     * Holds deliveries that were put back because their endpoint had no free permit.
+     *
+     * <p>Separate from the retry tiers because a deferral is not a retry: nothing was attempted, so
+     * it must not consume one of the eight attempts, and it should come back in seconds rather than
+     * on the backoff ladder.
+     *
+     * <p>A single fixed TTL, not a jittered one. Every message in this queue then has the same delay,
+     * so no message can be stuck behind another — the head-of-line lesson from phase 4 applied by
+     * construction rather than discovered by measurement. Mixing 2-second deferrals into
+     * {@code retry.5s}, whose messages carry 4-6 second TTLs, would have reintroduced exactly that
+     * bug.
+     */
+    @Bean
+    public Declarables deferredQueue() {
+        Queue queue = QueueBuilder.durable(DEFERRED_QUEUE)
+                .ttl(DEFERRAL_DELAY_MS)
+                .deadLetterExchange(EXCHANGE)
+                .deadLetterRoutingKey(DELIVERY_ROUTING_KEY)
+                .build();
+        return new Declarables(queue,
+                new Binding(DEFERRED_QUEUE, Binding.DestinationType.QUEUE,
+                        RETRY_EXCHANGE, DEFERRED_QUEUE, null));
     }
 
     // ---- dead letters -------------------------------------------------------------------------

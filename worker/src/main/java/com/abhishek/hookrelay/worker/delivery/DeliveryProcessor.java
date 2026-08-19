@@ -4,16 +4,21 @@ import com.abhishek.hookrelay.common.domain.Delivery;
 import com.abhishek.hookrelay.common.domain.DeliveryStatus;
 import com.abhishek.hookrelay.common.domain.Endpoint;
 import com.abhishek.hookrelay.common.domain.Event;
+import com.abhishek.hookrelay.common.net.DestinationPolicy;
+import com.abhishek.hookrelay.common.net.SsrfGuard;
 import com.abhishek.hookrelay.common.repo.DeliveryRepository;
 import com.abhishek.hookrelay.common.repo.EndpointRepository;
 import com.abhishek.hookrelay.common.repo.EventRepository;
 import com.abhishek.hookrelay.common.retry.RetryPolicy;
 import com.abhishek.hookrelay.common.retry.RetryTier;
 import com.abhishek.hookrelay.common.webhook.WebhookEnvelope;
+import com.abhishek.hookrelay.worker.isolation.CircuitBreakerRegistry;
+import com.abhishek.hookrelay.worker.isolation.EndpointSemaphores;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.nio.charset.StandardCharsets;
@@ -24,16 +29,34 @@ import java.util.Optional;
 import java.util.UUID;
 
 /**
- * Processes one delivery: claim, load, sign, send, record.
+ * Processes one delivery: gate, claim, sign, send, record, route.
  *
- * <p>The order is load-bearing. Nothing is acknowledged to the broker until the outcome is committed
- * to PostgreSQL, so a worker that dies at any point leaves the message unacknowledged and it is
- * redelivered rather than lost.
+ * <p>The order of the gates is load-bearing, and it is the reason this is not simply a sequence of
+ * {@code if} statements in the order they were invented:
+ *
+ * <pre>
+ *   already SUCCEEDED?              → acknowledge, no work            (phase 3)
+ *   endpoint permit available?      → NO: defer, and DO NOT claim     (phase 5)
+ *   claim the attempt atomically                                      (phase 3)
+ *   circuit breaker permits?        → NO: record CIRCUIT_OPEN         (phase 5)
+ *   destination address allowed?    → NO: record SSRF_BLOCKED, dead   (phase 5)
+ *   sign, POST, record, route                                    (phases 3, 4)
+ * </pre>
+ *
+ * <p>The permit check sits <em>before</em> the claim because a deferral is not an attempt: nothing
+ * was sent and nothing failed, so consuming one of the eight attempts would let a busy period
+ * exhaust the retry ladder for deliveries that were never tried. The breaker check sits
+ * <em>after</em> it, because refusing to call a known-dead endpoint <em>is</em> a failed attempt and
+ * should be recorded as one.
  */
 @Component
 public class DeliveryProcessor {
 
     private static final Logger log = LoggerFactory.getLogger(DeliveryProcessor.class);
+
+    public static final String ERROR_CIRCUIT_OPEN = "CIRCUIT_OPEN";
+    public static final String ERROR_CAPACITY = "CAPACITY";
+    public static final String ERROR_SSRF_BLOCKED = "SSRF_BLOCKED";
 
     private final DeliveryRepository deliveries;
     private final EndpointRepository endpoints;
@@ -41,7 +64,11 @@ public class DeliveryProcessor {
     private final DeliveryStore store;
     private final WebhookSender sender;
     private final RetryPublisher retries;
+    private final EndpointSemaphores permits;
+    private final CircuitBreakerRegistry breakers;
+    private final DestinationPolicy destinations;
     private final ObjectMapper objectMapper;
+    private final int maxDeferrals;
 
     public DeliveryProcessor(DeliveryRepository deliveries,
                              EndpointRepository endpoints,
@@ -49,35 +76,41 @@ public class DeliveryProcessor {
                              DeliveryStore store,
                              WebhookSender sender,
                              RetryPublisher retries,
-                             ObjectMapper objectMapper) {
+                             EndpointSemaphores permits,
+                             CircuitBreakerRegistry breakers,
+                             DestinationPolicy destinations,
+                             ObjectMapper objectMapper,
+                             @Value("${hookrelay.isolation.max-deferrals}") int maxDeferrals) {
         this.deliveries = deliveries;
         this.endpoints = endpoints;
         this.events = events;
         this.store = store;
         this.sender = sender;
         this.retries = retries;
+        this.permits = permits;
+        this.breakers = breakers;
+        this.destinations = destinations;
         this.objectMapper = objectMapper;
+        this.maxDeferrals = maxDeferrals;
+    }
+
+    public Optional<AttemptOutcome> process(UUID deliveryId) {
+        return process(deliveryId, 0);
     }
 
     /**
-     * @return the outcome, or empty when there was nothing to do — the delivery had already
-     *         succeeded, or its delivery/endpoint/event rows are gone. Either way the caller
-     *         acknowledges: redelivering would not change the answer.
+     * @param deferrals how many times this delivery has already been put back for lack of a permit
+     * @return the outcome, or empty when nothing was attempted — already succeeded, rows missing, or
+     *         deferred. In every one of those cases the caller acknowledges.
      */
-    public Optional<AttemptOutcome> process(UUID deliveryId) {
-        // Claiming is what makes a redelivered message safe. An empty result means another worker
-        // already completed this delivery — most likely one that died between the customer's 200
-        // and its acknowledgement, which is a window that cannot be closed, only handled.
-        Optional<Integer> claimed = store.claimAttempt(deliveryId);
-        if (claimed.isEmpty()) {
-            log.debug("delivery {} already succeeded or missing, skipping", deliveryId);
-            return Optional.empty();
-        }
-        int attemptNo = claimed.get();
-
+    public Optional<AttemptOutcome> process(UUID deliveryId, int deferrals) {
         Delivery delivery = deliveries.findById(deliveryId).orElse(null);
         if (delivery == null) {
-            log.warn("delivery {} vanished after claim", deliveryId);
+            log.warn("delivery {} does not exist", deliveryId);
+            return Optional.empty();
+        }
+        if (delivery.getStatus() == DeliveryStatus.SUCCEEDED) {
+            log.debug("delivery {} already succeeded, skipping", deliveryId);
             return Optional.empty();
         }
 
@@ -89,25 +122,89 @@ public class DeliveryProcessor {
             return Optional.empty();
         }
 
-        byte[] body;
-        try {
-            body = serializeEnvelope(delivery, event);
-        } catch (JsonProcessingException e) {
-            log.error("could not serialize envelope for delivery {}", deliveryId, e);
-            store.markDeadWithoutAttempt(deliveryId, "envelope serialization failed");
-            return Optional.empty();
+        // Non-blocking. A blocking acquire would respect the limit and still hand the thread to the
+        // slow endpoint, which is the failure this whole phase exists to remove.
+        if (!permits.tryAcquire(endpoint.getId(), endpoint.getMaxConcurrency())) {
+            if (deferrals < maxDeferrals) {
+                retries.defer(deliveryId, deferrals);
+                return Optional.empty();
+            }
+            // Bounded: a permanently saturated endpoint would otherwise cycle forever. Hand it to
+            // the retry ladder, which is already bounded and ends at the DLQ.
+            log.warn("delivery {} deferred {} times, recording a capacity failure",
+                    deliveryId, deferrals);
+            return claimAndRoute(deliveryId, endpoint.getId(),
+                    synthetic(AttemptOutcome.Classification.RETRYABLE, ERROR_CAPACITY));
         }
 
-        OffsetDateTime startedAt = OffsetDateTime.now();
-        AttemptOutcome outcome = sender.send(
-                endpoint.getUrl(), endpoint.getSecret(), body,
-                delivery.getId(), event.getId(), event.getEventType(), attemptNo);
+        try {
+            if (!breakers.tryPermit(endpoint.getId())) {
+                return claimAndRoute(deliveryId, endpoint.getId(),
+                        synthetic(AttemptOutcome.Classification.RETRYABLE, ERROR_CIRCUIT_OPEN));
+            }
 
-        route(deliveryId, endpoint.getId(), attemptNo, startedAt, outcome);
+            // Re-validated here, on a fresh lookup, because a hostname that was public at
+            // registration can point somewhere internal by now.
+            SsrfGuard.Result destination = destinations.check(endpoint.getUrl(), false);
+            if (!destination.allowed()) {
+                log.warn("delivery {} blocked: {}", deliveryId, destination.reason());
+                breakers.recordFailure(endpoint.getId());
+                return claimAndRoute(deliveryId, endpoint.getId(),
+                        synthetic(AttemptOutcome.Classification.PERMANENT, ERROR_SSRF_BLOCKED));
+            }
 
-        log.debug("delivery {} attempt {} -> {} ({}ms)",
-                deliveryId, attemptNo, outcome.classification(), outcome.durationMs());
+            Optional<Integer> claimed = store.claimAttempt(deliveryId);
+            if (claimed.isEmpty()) {
+                breakers.recordSuccess(endpoint.getId());
+                return Optional.empty();
+            }
+            int attemptNo = claimed.get();
+
+            byte[] body;
+            try {
+                body = serializeEnvelope(delivery, event);
+            } catch (JsonProcessingException e) {
+                log.error("could not serialize envelope for delivery {}", deliveryId, e);
+                store.markDeadWithoutAttempt(deliveryId, "envelope serialization failed");
+                breakers.recordSuccess(endpoint.getId());
+                return Optional.empty();
+            }
+
+            OffsetDateTime startedAt = OffsetDateTime.now();
+            AttemptOutcome outcome = sender.send(
+                    endpoint.getUrl(), endpoint.getSecret(), body,
+                    delivery.getId(), event.getId(), event.getEventType(), attemptNo);
+
+            if (outcome.succeeded()) {
+                breakers.recordSuccess(endpoint.getId());
+            } else {
+                breakers.recordFailure(endpoint.getId());
+            }
+
+            route(deliveryId, endpoint.getId(), attemptNo, startedAt, outcome);
+            log.debug("delivery {} attempt {} -> {} ({}ms)",
+                    deliveryId, attemptNo, outcome.classification(), outcome.durationMs());
+            return Optional.of(outcome);
+
+        } finally {
+            permits.release(endpoint.getId());
+        }
+    }
+
+    /** Records a failure that happened without an HTTP request, and routes it. */
+    private Optional<AttemptOutcome> claimAndRoute(UUID deliveryId, UUID endpointId,
+                                                   AttemptOutcome outcome) {
+        Optional<Integer> claimed = store.claimAttempt(deliveryId);
+        if (claimed.isEmpty()) {
+            return Optional.empty();
+        }
+        route(deliveryId, endpointId, claimed.get(), OffsetDateTime.now(), outcome);
         return Optional.of(outcome);
+    }
+
+    private static AttemptOutcome synthetic(AttemptOutcome.Classification classification,
+                                            String errorClass) {
+        return new AttemptOutcome(classification, null, errorClass, null, 0);
     }
 
     /**
@@ -173,5 +270,4 @@ public class DeliveryProcessor {
                 event.getPayload());
         return objectMapper.writeValueAsString(envelope).getBytes(StandardCharsets.UTF_8);
     }
-
 }

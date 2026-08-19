@@ -336,13 +336,81 @@ JAVA_HOME=$(/usr/libexec/java_home -v 21) mvn -pl common,worker -Dtest=DelayQueu
 
 ---
 
+## Phase 5 — Endpoint isolation and destination security
+
+### 5.1 Test suite
+
+```bash
+JAVA_HOME=$(/usr/libexec/java_home -v 21) mvn test
+```
+
+| Module | Tests | Failures | Errors |
+|---|---:|---:|---:|
+| `hookrelay-common` | 70 | 0 | 0 |
+| `hookrelay-api` | 43 | 0 | 0 |
+| `hookrelay-worker` | 57 | 0 | 0 |
+| **Total** | **170** | **0** | **0** |
+
+---
+
+### 5.2 Does a slow endpoint starve a healthy one?
+
+**Question.** One customer's endpoint goes slow. How much does that cost every other customer, and
+how much of it does a per-endpoint concurrency limit recover?
+
+**Workload.** Two endpoints share the worker pool (4 listener threads, prefetch 8). The slow one takes
+2 s per request and **succeeds**, so the circuit breaker stays closed and concurrency is the only
+variable; the healthy one answers instantly. A backlog of 24 slow deliveries is published first, then
+10 healthy ones. Latency is measured from publishing the healthy batch to the request arriving.
+
+The baseline is not a feature flag — an endpoint with `max_concurrency = 10 000` has a semaphore that
+never blocks, which *is* the unisolated behaviour, so both arms run the shipped code path.
+
+**Result** (representative run; range across three runs in brackets):
+
+| Measurement | Without isolation | With isolation | Improvement |
+|---|---:|---:|---:|
+| Healthy endpoint **p50** | **12 644 ms** [12.3–16.3 s] | **72 ms** [63–192 ms] | **176×** |
+| Healthy endpoint p95 | 12 661 ms | 2 067 ms | 6.1× |
+| Healthy endpoint **p99** | **12 661 ms** | **2 067 ms** [2.07–2.11 s] | **6.1×** |
+
+**Interpretation.**
+
+The unisolated number is exactly what the mechanism predicts: 24 slow requests × 2 s ÷ 4 worker
+threads = 12 s. Every healthy delivery waited behind the slow endpoint's backlog in the consumers'
+prefetch buffers. Nothing failed and nothing was logged — every metric except latency looked normal,
+which is what makes this failure mode worth engineering against.
+
+The residual 2 s at p99 with isolation is **not noise and not fixable by this mechanism**. A semaphore
+stops a healthy delivery *queueing* behind the slow endpoint, but cannot preempt a slow request
+already in flight on the thread that then picks the healthy one up. One in-flight 2-second request is
+the worst case, and 2 067 ms is that worst case; p50 of 72 ms shows the common case is unaffected.
+
+**Reproduce — standalone, not inside the full suite:**
+
+```bash
+JAVA_HOME=$(/usr/libexec/java_home -v 21) mvn -pl common,worker -Dtest=NoisyNeighbourTest -Dsurefire.failIfNoSpecifiedTests=false test
+```
+
+Inside the full suite the unisolated arm reports p50 ≈ 3 200 ms instead of ≈ 12 600 ms. That is
+contamination, not a better result: Spring's test-context cache keeps every worker test class's
+application alive for the whole JVM, each with its own listener container consuming the same
+`deliveries` queue, so the effective pool is several times four threads.
+
+**Two earlier versions of this experiment were wrong**, both documented in
+docs/phase05-isolation-security.md §7: publishing the two endpoints' deliveries interleaved let
+RabbitMQ's round-robin partition the work across consumers so the baseline never starved (and
+isolation looked *worse* at the tail); and the test HTTP server's default executor is single-threaded,
+which inflated the baseline to ~44 s for reasons unrelated to worker starvation.
+
+---
+
 ## Not yet measured
 
 Listed so their absence is explicit rather than an oversight.
 
 | Result | Phase |
 |---|---|
-| Endpoint isolation: healthy-endpoint p95/p99 with and without the semaphore + breaker | 5 |
 | Rolling deployment under load: dropped requests, lost deliveries | 7 |
 | CPU-based HPA vs KEDA queue-depth scaling | 8 |
 | Ingest throughput and p50/p95/p99 at ~1,000 events/sec | 8 |

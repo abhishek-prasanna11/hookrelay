@@ -17,7 +17,7 @@ import org.springframework.scheduling.annotation.EnableScheduling;
  */
 @SpringBootApplication(scanBasePackageClasses = {
         HookRelayApiApplication.class,
-        com.abhishek.hookrelay.common.messaging.RabbitTopology.class
+        com.abhishek.hookrelay.common.CommonModule.class
 })
 @EntityScan(basePackageClasses = Event.class)
 @EnableJpaRepositories(basePackageClasses = EventRepository.class)

@@ -4,9 +4,10 @@ A webhook delivery platform. You hand it an event once; it guarantees the event 
 subscribed HTTP endpoint — surviving worker crashes, dead destinations, slow destinations,
 duplicate submissions, its own redeployments, and traffic spikes.
 
-**Status: phases 1–4 of 10 complete.** Ingest API, durable event store, transactional outbox,
-RabbitMQ publishing, a worker performing real signed HTTP delivery, and bounded exponential retries
-with a dead-letter queue are built and tested. Endpoint isolation starts in phase 5.
+**Status: phases 1-5 of 10 complete.** Ingest API, durable event store, transactional outbox,
+RabbitMQ publishing, a worker performing real signed HTTP delivery, bounded exponential retries with
+a dead-letter queue, and per-endpoint isolation with SSRF protection are built and tested.
+Observability starts in phase 6.
 
 ---
 
@@ -109,6 +110,18 @@ retry behind it. Measured: a 400 ms retry stuck behind a 6000 ms one came out at
 (15.1× overshoot); with per-tier queues, **405 ms**. Jitter reintroduces blocking *within* a tier,
 bounded by the jitter spread — measured at 407 ms against a predicted 400 ms.
 
+**A non-blocking per-endpoint concurrency limit.** Blocking on a semaphore respects the limit and
+starves the pool just as thoroughly, because the scarce resource is the worker thread, not the
+outbound request. A failed `tryAcquire` defers the delivery instead — and a deferral must not consume
+one of the eight attempts, which is why the permit check sits *before* the attempt is claimed.
+Measured: a healthy endpoint's p50 went from **12 644 ms to 72 ms** with a slow neighbour present.
+
+**SSRF checks on the resolved address, at delivery time.** The endpoint URL is the one input that is
+*supposed* to be arbitrary, and the worker runs inside the cluster where `169.254.169.254` and
+`kubernetes.default.svc` are reachable. Checking the hostname is useless — `evil.example.com` can
+resolve to `127.0.0.1`. DNS rebinding is narrowed rather than closed, and the residual gap is
+documented rather than glossed.
+
 **UUIDv7 primary keys.** `deliveries.id` is public, so it cannot be a sequential integer — but
 random UUIDv4 scatters inserts across the B-tree and splits pages constantly. v7 embeds a
 millisecond timestamp, so inserts append to the index's right edge while staying unguessable.
@@ -119,7 +132,7 @@ millisecond timestamp, so inserts append to the index's right edge while staying
 
 | Result | Value |
 |---|---|
-| Test suite | 105 tests, 0 failures |
+| Test suite | 170 tests, 0 failures |
 | Duplicate events under 20 concurrent identical submissions — app-level check | **16** |
 | Duplicate events under 20 concurrent identical submissions — DB constraint | **1** |
 | Deliveries lost to a crash between commit and publish — direct publish | **10 of 10** |
@@ -131,6 +144,9 @@ millisecond timestamp, so inserts append to the index's right edge while staying
 | Short retry stuck behind a long one — one shared delay queue | **6024 ms** (nominal 400 ms) |
 | Short retry — one queue per backoff tier | **405 ms** |
 | Head-of-line blocking within a tier vs predicted jitter bound | **407 ms** vs 400 ms |
+| Healthy endpoint p50 while a slow endpoint has a backlog — no isolation | **12 644 ms** |
+| Healthy endpoint p50 — per-endpoint concurrency limit | **72 ms** (176x) |
+| Healthy endpoint p99 — isolated (one in-flight slow request) | **2 067 ms** |
 
 Full detail, with commands to reproduce: [RESULTS.md](RESULTS.md).
 
@@ -167,7 +183,7 @@ no local database or broker is needed. Full command reference: [REFERENCE.md](RE
 | 2 | Outbox + RabbitMQ | done |
 | 3 | Worker + delivery | done |
 | 4 | Retry + DLQ | done |
-| 5 | Isolation + security | |
+| 5 | Isolation + security | done |
 | 6 | Observability | |
 | 7 | Docker + Kubernetes | |
 | 8 | KEDA + load testing | |

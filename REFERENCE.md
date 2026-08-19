@@ -1,6 +1,6 @@
 # HookRelay — Reference
 
-Current as of **phase 4**. Sections for the Kubernetes topology arrive with the phases that build
+Current as of **phase 5**. Sections for the Kubernetes topology arrive with the phases that build
 them.
 
 ---
@@ -319,6 +319,83 @@ around the SSRF checks that arrive in phase 5.
 | `hookrelay.delivery.request-timeout-ms` | `15000` | Total budget for the exchange. Java's `HttpClient` has no separate socket-read timeout, so this bounds an endpoint that trickles bytes. |
 | `hookrelay.delivery.max-response-bytes` | `512` | A hostile endpoint returning gigabytes must not OOM the worker. Matches the `CHECK` on `delivery_attempts.response_body`. |
 | `spring.flyway.enabled` | `false` | The API owns migrations; the worker only validates against them. |
+| `hookrelay.isolation.max-deferrals` | `50` | A deferral does not consume an attempt, so the loop needs its own bound (≈100 s), after which it becomes a `CAPACITY` failure on the retry ladder. |
+| `hookrelay.circuit-breaker.failure-threshold` | `5` | **Consecutive**, not cumulative. An endpoint that fails occasionally and recovers should never trip. |
+| `hookrelay.circuit-breaker.cooldown-ms` | `30000` | Shorter than the 2-minute gap before attempt 4, so a recovering endpoint is probed while it still has attempts left. |
+| `hookrelay.security.allow-private-destinations` | `false` | **Local development only.** Allows destinations resolving to loopback/private/link-local and skips DNS resolution. Both services must agree. |
+
+---
+
+## Endpoint isolation
+
+### Per-endpoint concurrency
+
+Each endpoint has at most `max_concurrency` requests in flight **per worker**. The acquire is
+non-blocking: a delivery that cannot get a permit is published to `deliveries.deferred` (fixed 2 s
+TTL, dead-lettering back to `deliveries`) and the thread moves on immediately.
+
+Blocking on the semaphore would respect the limit and starve the pool just as thoroughly — the
+scarce resource is the worker thread, not the outbound request.
+
+**A deferral is not an attempt.** Nothing was sent and nothing failed, so `attempt_count` is
+untouched and the permit check runs *before* the attempt is claimed. Bounded at
+`max-deferrals`, after which the delivery records a `CAPACITY` failure and joins the retry ladder.
+
+Measured: a healthy endpoint's p50 goes from **12 644 ms to 72 ms** when a slow endpoint with a
+backlog shares the pool — see [RESULTS.md](RESULTS.md#52-does-a-slow-endpoint-starve-a-healthy-one).
+
+### Circuit breaker
+
+Per endpoint, per worker, in memory.
+
+```text
+   CLOSED ──5 consecutive failures──► OPEN ──30s cooldown──► HALF_OPEN
+      ▲                                ▲                        │
+      └────── probe succeeds ──────────┴─── probe fails ────────┘
+```
+
+While open, a delivery records a `CIRCUIT_OPEN` attempt **with no HTTP call** and joins the retry
+ladder — it is a real failed attempt (we declined to try), bounded by the ladder that already
+exists, rather than a deferral that would loop for the length of the outage.
+
+With *W* workers an endpoint has *W* independent breakers, so it takes `W × threshold` failures to
+shut it off everywhere. A shared breaker needs Redis (BLUEPRINT.md §32).
+
+### Additional error classes
+
+| `error_class` | Meaning | Classification |
+|---|---|---|
+| `CIRCUIT_OPEN` | Breaker open; no request made | Retryable |
+| `CAPACITY` | Deferred past the cap; no request made | Retryable |
+| `SSRF_BLOCKED` | Destination resolved to a blocked address | Permanent → DLQ |
+
+---
+
+## Destination security (SSRF)
+
+Endpoint URLs are attacker-controlled and the worker runs inside the cluster. Validation happens at
+registration **and again at delivery time on a fresh DNS lookup**, against the **resolved address** —
+checking the hostname is useless, since `evil.example.com` can resolve to `127.0.0.1`.
+
+Blocked: loopback, wildcard, link-local (including `169.254.169.254`, the cloud metadata service),
+private ranges, carrier-grade NAT, benchmarking, broadcast, multicast, IPv6 unique-local, and
+IPv4-mapped IPv6 addresses decoding to any of the above. Also rejected: non-`http(s)` schemes, and
+userinfo in the URL.
+
+Redirects are never followed (phase 3) — without that, a public URL answering
+`302 Location: http://169.254.169.254/` bypasses all of the above inside the HTTP library.
+
+A host that does not resolve is **allowed at registration** (DNS may be temporarily broken) and
+**refused at delivery**.
+
+### Known limitation: DNS rebinding is narrowed, not closed
+
+Validation and the HTTP client each resolve the hostname, and only the first lookup is checked — a
+time-of-check to time-of-use gap. Closing it means connecting to the exact validated IP, which
+`java.net.http.HttpClient` does not expose; rewriting the URL to the literal address works for
+`http` and breaks TLS certificate verification for `https`. The JVM's DNS cache means the second
+lookup almost always returns the first's answer, which narrows the window to microseconds — a
+mitigation, not a guarantee.
 
 ---
 

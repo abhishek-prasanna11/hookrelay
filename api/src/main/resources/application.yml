@@ -60,6 +60,13 @@ management:
         enabled: true
 
 hookrelay:
+  security:
+    # Allows webhook destinations that resolve to loopback, private or link-local addresses, and
+    # skips DNS resolution entirely. Required for local development against a receiver on
+    # localhost. Setting this in production removes the only thing between a customer-supplied URL
+    # and the cluster's internal network — see docs/phase05-isolation-security.md section 1.5.
+    allow-private-destinations: false
+
   ingest:
     # Rejected with 422 above this size. Keeps a single event from monopolising memory and from
     # producing a webhook body no receiver will accept.
