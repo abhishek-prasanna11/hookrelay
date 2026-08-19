@@ -14,10 +14,12 @@ import com.abhishek.hookrelay.common.retry.RetryTier;
 import com.abhishek.hookrelay.common.webhook.WebhookEnvelope;
 import com.abhishek.hookrelay.worker.isolation.CircuitBreakerRegistry;
 import com.abhishek.hookrelay.worker.isolation.EndpointSemaphores;
+import com.abhishek.hookrelay.worker.metrics.DeliveryMetrics;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -67,6 +69,7 @@ public class DeliveryProcessor {
     private final EndpointSemaphores permits;
     private final CircuitBreakerRegistry breakers;
     private final DestinationPolicy destinations;
+    private final DeliveryMetrics metrics;
     private final ObjectMapper objectMapper;
     private final int maxDeferrals;
 
@@ -79,6 +82,7 @@ public class DeliveryProcessor {
                              EndpointSemaphores permits,
                              CircuitBreakerRegistry breakers,
                              DestinationPolicy destinations,
+                             DeliveryMetrics metrics,
                              ObjectMapper objectMapper,
                              @Value("${hookrelay.isolation.max-deferrals}") int maxDeferrals) {
         this.deliveries = deliveries;
@@ -90,6 +94,7 @@ public class DeliveryProcessor {
         this.permits = permits;
         this.breakers = breakers;
         this.destinations = destinations;
+        this.metrics = metrics;
         this.objectMapper = objectMapper;
         this.maxDeferrals = maxDeferrals;
     }
@@ -104,6 +109,21 @@ public class DeliveryProcessor {
      *         deferred. In every one of those cases the caller acknowledges.
      */
     public Optional<AttemptOutcome> process(UUID deliveryId, int deferrals) {
+        // Set once here so every subsequent log line carries it, including ones written deep inside
+        // helpers that know nothing about deliveries. These are the identifiers deliberately kept
+        // out of metric labels: in logs, high cardinality costs nothing.
+        MDC.put("delivery_id", deliveryId.toString());
+        try {
+            return processWithContext(deliveryId, deferrals);
+        } finally {
+            // Worker threads are pooled and reused; without this the next delivery inherits these.
+            MDC.remove("delivery_id");
+            MDC.remove("event_id");
+            MDC.remove("endpoint_id");
+        }
+    }
+
+    private Optional<AttemptOutcome> processWithContext(UUID deliveryId, int deferrals) {
         Delivery delivery = deliveries.findById(deliveryId).orElse(null);
         if (delivery == null) {
             log.warn("delivery {} does not exist", deliveryId);
@@ -116,6 +136,12 @@ public class DeliveryProcessor {
 
         Endpoint endpoint = endpoints.findById(delivery.getEndpointId()).orElse(null);
         Event event = events.findById(delivery.getEventId()).orElse(null);
+        if (endpoint != null) {
+            MDC.put("endpoint_id", endpoint.getId().toString());
+        }
+        if (event != null) {
+            MDC.put("event_id", event.getId().toString());
+        }
         if (endpoint == null || event == null) {
             store.markDeadWithoutAttempt(deliveryId,
                     endpoint == null ? "endpoint no longer exists" : "event no longer exists");
@@ -126,6 +152,7 @@ public class DeliveryProcessor {
         // slow endpoint, which is the failure this whole phase exists to remove.
         if (!permits.tryAcquire(endpoint.getId(), endpoint.getMaxConcurrency())) {
             if (deferrals < maxDeferrals) {
+                metrics.recordDeferral();
                 retries.defer(deliveryId, deferrals);
                 return Optional.empty();
             }
@@ -171,9 +198,21 @@ public class DeliveryProcessor {
             }
 
             OffsetDateTime startedAt = OffsetDateTime.now();
-            AttemptOutcome outcome = sender.send(
-                    endpoint.getUrl(), endpoint.getSecret(), body,
-                    delivery.getId(), event.getId(), event.getEventType(), attemptNo);
+            AttemptOutcome outcome;
+            metrics.deliveryStarted();
+            try {
+                outcome = sender.send(
+                        endpoint.getUrl(), endpoint.getSecret(), body,
+                        delivery.getId(), event.getId(), event.getEventType(), attemptNo);
+            } finally {
+                metrics.deliveryFinished();
+            }
+
+            if (outcome.succeeded()) {
+                // Accepted (202) until delivered — what the customer actually experienced, and a
+                // different quantity from how long this one HTTP request took.
+                metrics.recordEndToEnd(Duration.between(event.getCreatedAt(), OffsetDateTime.now()));
+            }
 
             if (outcome.succeeded()) {
                 breakers.recordSuccess(endpoint.getId());
@@ -222,6 +261,8 @@ public class DeliveryProcessor {
      */
     private void route(UUID deliveryId, UUID endpointId, int attemptNo,
                        OffsetDateTime startedAt, AttemptOutcome outcome) {
+        metrics.recordAttempt(outcome, attemptNo);
+
         if (outcome.succeeded()) {
             store.recordAttempt(deliveryId, attemptNo, startedAt, outcome,
                     DeliveryStatus.SUCCEEDED, null);
@@ -230,6 +271,7 @@ public class DeliveryProcessor {
 
         if (outcome.classification() == AttemptOutcome.Classification.PERMANENT) {
             store.recordAttempt(deliveryId, attemptNo, startedAt, outcome, DeliveryStatus.DEAD, null);
+            metrics.recordDeadLettered(RetryPublisher.REASON_PERMANENT_FAILURE);
             retries.deadLetter(deliveryId, endpointId, RetryPublisher.REASON_PERMANENT_FAILURE,
                     attemptNo, describe(outcome));
             return;
@@ -238,6 +280,7 @@ public class DeliveryProcessor {
         Optional<RetryTier> tier = RetryPolicy.tierAfter(attemptNo);
         if (tier.isEmpty()) {
             store.recordAttempt(deliveryId, attemptNo, startedAt, outcome, DeliveryStatus.DEAD, null);
+            metrics.recordDeadLettered(RetryPublisher.REASON_ATTEMPTS_EXHAUSTED);
             retries.deadLetter(deliveryId, endpointId, RetryPublisher.REASON_ATTEMPTS_EXHAUSTED,
                     attemptNo, describe(outcome));
             return;

@@ -4,10 +4,10 @@ A webhook delivery platform. You hand it an event once; it guarantees the event 
 subscribed HTTP endpoint — surviving worker crashes, dead destinations, slow destinations,
 duplicate submissions, its own redeployments, and traffic spikes.
 
-**Status: phases 1-5 of 10 complete.** Ingest API, durable event store, transactional outbox,
+**Status: phases 1-6 of 10 complete.** Ingest API, durable event store, transactional outbox,
 RabbitMQ publishing, a worker performing real signed HTTP delivery, bounded exponential retries with
-a dead-letter queue, and per-endpoint isolation with SSRF protection are built and tested.
-Observability starts in phase 6.
+a dead-letter queue, per-endpoint isolation with SSRF protection, and Prometheus/Grafana
+observability are built and tested. Containers and Kubernetes start in phase 7.
 
 ---
 
@@ -122,6 +122,12 @@ Measured: a healthy endpoint's p50 went from **12 644 ms to 72 ms** with a slow 
 resolve to `127.0.0.1`. DNS rebinding is narrowed rather than closed, and the residual gap is
 documented rather than glossed.
 
+**Metrics answer "how much and how bad"; logs answer "which one".** `endpoint_id` is the label you
+most want during an incident and the one that destroys a metrics system: measured at **3 series vs
+150** for 50 endpoints, extrapolating to **30 000 series and 2.9 MB per scrape** at 10 000 endpoints,
+from a single counter. Identifiers go to structured logs via MDC, and a test scans every meter for
+UUID-shaped label values so the rule cannot decay.
+
 **UUIDv7 primary keys.** `deliveries.id` is public, so it cannot be a sequential integer — but
 random UUIDv4 scatters inserts across the B-tree and splits pages constantly. v7 embeds a
 millisecond timestamp, so inserts append to the index's right edge while staying unguessable.
@@ -132,7 +138,7 @@ millisecond timestamp, so inserts append to the index's right edge while staying
 
 | Result | Value |
 |---|---|
-| Test suite | 170 tests, 0 failures |
+| Test suite | 181 tests, 0 failures |
 | Duplicate events under 20 concurrent identical submissions — app-level check | **16** |
 | Duplicate events under 20 concurrent identical submissions — DB constraint | **1** |
 | Deliveries lost to a crash between commit and publish — direct publish | **10 of 10** |
@@ -147,6 +153,8 @@ millisecond timestamp, so inserts append to the index's right edge while staying
 | Healthy endpoint p50 while a slow endpoint has a backlog — no isolation | **12 644 ms** |
 | Healthy endpoint p50 — per-endpoint concurrency limit | **72 ms** (176x) |
 | Healthy endpoint p99 — isolated (one in-flight slow request) | **2 067 ms** |
+| Series from `deliveries_total{result}` at 10 000 endpoints | **3** (232 B/scrape) |
+| Series if labelled by `endpoint_id` as well | **30 000** (2.9 MB/scrape) |
 
 Full detail, with commands to reproduce: [RESULTS.md](RESULTS.md).
 
@@ -184,7 +192,7 @@ no local database or broker is needed. Full command reference: [REFERENCE.md](RE
 | 3 | Worker + delivery | done |
 | 4 | Retry + DLQ | done |
 | 5 | Isolation + security | done |
-| 6 | Observability | |
+| 6 | Observability | done |
 | 7 | Docker + Kubernetes | |
 | 8 | KEDA + load testing | |
 | 9 | CI/CD | |

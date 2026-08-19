@@ -147,6 +147,24 @@ public class CircuitBreakerRegistry {
         }
     }
 
+    /**
+     * How many endpoints are in each state.
+     *
+     * <p>Exposed this way rather than per endpoint because a metric labelled by endpoint id creates
+     * one time series per customer — see docs/phase06-observability.md §1.3.
+     */
+    public Map<State, Integer> countByState() {
+        Map<State, Integer> counts = new java.util.EnumMap<>(State.class);
+        for (Breaker breaker : byEndpoint.values()) {
+            State state;
+            synchronized (breaker) {
+                state = breaker.state;
+            }
+            counts.merge(state, 1, Integer::sum);
+        }
+        return counts;
+    }
+
     /** Test seam. */
     void reset() {
         byEndpoint.clear();

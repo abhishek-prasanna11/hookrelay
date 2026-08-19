@@ -93,7 +93,11 @@ class NoisyNeighbourTest extends AbstractWorkerIntegrationTest {
      * acknowledge immediately on its next pass.
      */
     @AfterEach
-    void quiesce() {
+    void quiesceAfterTest() {
+        quiesceBetweenArms();
+    }
+
+    private void quiesceBetweenArms() {
         jdbc.update("UPDATE deliveries SET status = 'SUCCEEDED' "
                 + "WHERE event_id IN (SELECT id FROM events WHERE tenant_id = ?)", tenant);
         await().atMost(Duration.ofSeconds(90)).until(() ->
@@ -125,28 +129,36 @@ class NoisyNeighbourTest extends AbstractWorkerIntegrationTest {
         return id;
     }
 
+    /**
+     * Both arms in one test, deliberately.
+     *
+     * <p>The assertion is a <em>ratio</em> between the two, not an absolute bound on either. The
+     * absolute numbers depend on how many worker applications happen to be consuming the queue,
+     * which varies with how the suite is run (see the class javadoc) — so an absolute threshold
+     * would either be so loose it proves nothing or fail for reasons unrelated to isolation. Running
+     * both arms back to back under identical conditions makes the comparison the measurement.
+     */
     @Test
-    @DisplayName("without isolation, the slow endpoint degrades the healthy one")
-    void withoutIsolation() {
-        List<Long> latencies = run("WITHOUT ISOLATION", UNLIMITED);
+    @DisplayName("a per-endpoint concurrency limit keeps a healthy endpoint responsive")
+    void isolationKeepsHealthyEndpointResponsive() {
+        List<Long> unisolated = run("WITHOUT ISOLATION", UNLIMITED);
+        quiesceBetweenArms();
+        List<Long> isolated = run("WITH ISOLATION", 1);
 
-        // Recorded rather than asserted tightly: the point is the comparison in the sibling test.
-        assertThat(latencies).hasSize(FAST_DELIVERIES);
-    }
+        assertThat(unisolated).hasSize(FAST_DELIVERIES);
+        assertThat(isolated).hasSize(FAST_DELIVERIES);
 
-    @Test
-    @DisplayName("with a concurrency limit, the healthy endpoint stays responsive")
-    void withIsolation() {
-        List<Long> latencies = run("WITH ISOLATION", 1);
+        long unisolatedP50 = percentile(unisolated, 50);
+        long isolatedP50 = percentile(isolated, 50);
 
-        assertThat(latencies).hasSize(FAST_DELIVERIES);
-        // With four worker threads and a 2s slow endpoint, an unisolated backlog of 24 costs about
-        // 12 seconds before a healthy delivery is even picked up. The bound here is deliberately
-        // loose — a slow request already in flight when a healthy one is claimed still costs its
-        // remaining time — but it is far below what the unisolated arm produces.
-        assertThat(percentile(latencies, 99))
-                .as("healthy endpoint p99 must not be dominated by the slow endpoint's backlog")
-                .isLessThan(3 * SLOW_ENDPOINT_DELAY_MS);
+        System.out.printf("ISOLATION GAIN     healthy p50 %dms -> %dms  (%.1fx)%n",
+                unisolatedP50, isolatedP50, unisolatedP50 / (double) Math.max(isolatedP50, 1));
+
+        // Measured at 176x standalone and ~97x inside the full suite; 5x is a floor that cannot be
+        // reached by noise but would catch the mechanism being broken.
+        assertThat(isolatedP50 * 5)
+                .as("healthy endpoint p50 should improve by at least 5x")
+                .isLessThan(unisolatedP50);
     }
 
     /**
@@ -154,6 +166,13 @@ class NoisyNeighbourTest extends AbstractWorkerIntegrationTest {
      * @return the healthy endpoint's per-delivery latencies, in milliseconds
      */
     private List<Long> run(String label, int slowEndpointConcurrency) {
+        // Both arms share the receivers, so recorded requests must be cleared between them —
+        // otherwise the second arm measures the first arm's requests against its own start time and
+        // reports negative latencies.
+        fastReceiver.reset();
+        slowReceiver.reset();
+        slowReceiver.delay(SLOW_ENDPOINT_DELAY_MS);
+
         UUID slowEndpoint = endpoint(slowReceiver.url(), slowEndpointConcurrency);
         UUID fastEndpoint = endpoint(fastReceiver.url(), 50);
 

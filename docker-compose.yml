@@ -30,6 +30,37 @@ services:
       timeout: 5s
       retries: 10
 
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: hookrelay-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - hookrelay-promdata:/prometheus
+    extra_hosts:
+      # Scrape targets are the API and worker running on the host, not in compose.
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: hookrelay-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/etc/grafana/dashboards:ro
+      - hookrelay-grafanadata:/var/lib/grafana
+    depends_on:
+      - prometheus
+
 volumes:
   hookrelay-pgdata:
   hookrelay-rabbitdata:
+  hookrelay-promdata:
+  hookrelay-grafanadata:

@@ -405,6 +405,59 @@ which inflated the baseline to ~44 s for reasons unrelated to worker starvation.
 
 ---
 
+## Phase 6 — Observability
+
+### 6.1 Test suite
+
+| Module | Tests | Failures | Errors |
+|---|---:|---:|---:|
+| `hookrelay-common` | 70 | 0 | 0 |
+| `hookrelay-api` | 43 | 0 | 0 |
+| `hookrelay-worker` | 68 | 0 | 0 |
+| **Total** | **181** | **0** | **0** |
+
+---
+
+### 6.2 What does one high-cardinality label cost?
+
+**Question.** BLUEPRINT.md §23 forbids `endpoint_id` as a metric label. What is the actual cost of
+breaking that rule?
+
+**Workload.** Two real `PrometheusMeterRegistry` instances, the same counter, the same traffic:
+50 endpoints × 3 results. One tagged `{result}`, the other `{result, endpoint_id}`. Both rendered
+exactly as Prometheus would scrape them.
+
+| Measurement | `{result}` | `{result, endpoint_id}` | Factor |
+|---|---:|---:|---:|
+| Time series | **3** | **150** | **50×** |
+| Scrape payload | 232 B | 15 278 B | **66×** |
+| Bytes per series | — | 101 B | |
+
+**Extrapolated to 10 000 endpoints** at the measured 101 bytes per series:
+
+| | Series | Payload per scrape |
+|---|---:|---:|
+| `{result}` | **3** | 232 B |
+| `{result, endpoint_id}` | **30 000** | **2.9 MB** |
+
+**Interpretation.** At a 5-second scrape interval that is ~35 MB/min of scrape traffic from **one
+counter**, growing every time a customer registers an endpoint — and multiplying again if
+`event_type` is added. The bounded version costs 3 series and 232 bytes regardless of customer
+count: the metric's size is a function of the design, not of business success.
+
+This is why identifiers live in structured logs instead. Metrics answer *how much and how bad*; logs
+answer *which one*. `MetricsIntegrationTest#noHighCardinalityLabels` scans every registered
+`hookrelay*` meter and fails if a label value looks like a UUID, so the rule is enforced rather than
+merely documented.
+
+**Reproduce:**
+
+```bash
+JAVA_HOME=$(/usr/libexec/java_home -v 21) mvn -pl common,worker -Dtest=CardinalityCostTest -Dsurefire.failIfNoSpecifiedTests=false test
+```
+
+---
+
 ## Not yet measured
 
 Listed so their absence is explicit rather than an oversight.

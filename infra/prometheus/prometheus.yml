@@ -1,0 +1,26 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Prometheus pulls; the applications never push. A wedged-but-running process still answers a
+  # scrape with stale values, while a dead one stops answering and Prometheus records up == 0 —
+  # failure to report is itself a signal.
+  - job_name: hookrelay-api
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+        labels:
+          service: api
+
+  - job_name: hookrelay-worker
+    metrics_path: /actuator/prometheus
+    static_configs:
+      # The worker's management server, separate from delivery work.
+      - targets: ["host.docker.internal:8081"]
+        labels:
+          service: worker
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

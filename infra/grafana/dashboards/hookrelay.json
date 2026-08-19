@@ -1,0 +1,206 @@
+{
+  "uid": "hookrelay-delivery",
+  "title": "HookRelay — Delivery",
+  "tags": ["hookrelay"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Delivery rate by result",
+      "description": "RED: rate and errors. A drop in 'success' with a rise in 'retryable' is an endpoint problem; a rise in 'permanent' is usually a customer misconfiguration.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(hookrelay_deliveries_total[1m]))",
+          "legendFormat": "{{result}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Success rate (5m)",
+      "description": "Successful attempts as a fraction of all attempts.",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.9 },
+              { "color": "green", "value": 0.99 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(hookrelay_deliveries_total{result=\"success\"}[5m])) / clamp_min(sum(rate(hookrelay_deliveries_total[5m])), 0.0001)",
+          "legendFormat": "success rate"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Dead-lettered (1h)",
+      "description": "Deliveries given up on. Any non-zero value means a customer is not receiving events.",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (increase(hookrelay_dlq_total[1h]))",
+          "legendFormat": "{{reason}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Attempt duration (how slow are customer endpoints)",
+      "description": "Duration of one HTTP attempt. NOT what the customer waited — see the end-to-end panel.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(hookrelay_delivery_duration_seconds_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(hookrelay_delivery_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(hookrelay_delivery_duration_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "End-to-end latency (the real SLO)",
+      "description": "Accepted (202) until delivered. A delivery that succeeds on attempt 8 has excellent attempt duration and terrible end-to-end latency; only this panel reflects what the customer experienced.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(hookrelay_end_to_end_latency_seconds_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(hookrelay_end_to_end_latency_seconds_bucket[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(hookrelay_end_to_end_latency_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Queue depth",
+      "description": "Saturation. Growth in 'deliveries' means workers are behind; growth in a retry tier means endpoints are failing; growth in 'deliveries.deferred' means endpoints are at their concurrency caps.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum by (queue) (hookrelay_queue_depth)",
+          "legendFormat": "{{queue}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Attempts by attempt number",
+      "description": "How much capacity is going into retries rather than first attempts.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum by (attempt_no) (rate(hookrelay_attempts_total[5m]))",
+          "legendFormat": "attempt {{attempt_no}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Failures by error class",
+      "description": "Distinguishes a slow endpoint (TIMEOUT) from a broken one (HTTP_5XX), from one we are deliberately shedding (CIRCUIT_OPEN), from our own capacity limit (CAPACITY).",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum by (error_class) (rate(hookrelay_attempt_failures_total[5m]))",
+          "legendFormat": "{{error_class}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Saturation: in-flight, breakers open, outbox lag",
+      "description": "Worker in-flight near its limit means saturation; low in-flight with a growing queue means workers are blocked, which is why CPU is the wrong autoscaling signal (phase 8).",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum(hookrelay_worker_inflight)",
+          "legendFormat": "in-flight deliveries"
+        },
+        {
+          "expr": "sum(hookrelay_circuit_breakers{state=\"open\"})",
+          "legendFormat": "endpoints shed (breaker open)"
+        },
+        {
+          "expr": "max(hookrelay_outbox_lag_seconds)",
+          "legendFormat": "outbox lag (s)"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Ingest: rate by result and latency",
+      "description": "The API's own RED. A rise in 'duplicate' is a producer retrying; 'conflict' means a producer is reusing an idempotency key with different content.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 32 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(hookrelay_events_total[1m]))",
+          "legendFormat": "{{result}}/s"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(hookrelay_ingest_latency_seconds_bucket[5m])))",
+          "legendFormat": "ingest p99 (s)"
+        }
+      ]
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 package com.abhishek.hookrelay.api.web;
 
 import com.abhishek.hookrelay.api.error.ApiException;
+import com.abhishek.hookrelay.api.metrics.IngestMetrics;
 import com.abhishek.hookrelay.api.service.IngestResult;
 import com.abhishek.hookrelay.api.service.IngestService;
 import com.abhishek.hookrelay.api.web.dto.EventResponse;
@@ -19,6 +20,7 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.time.Duration;
 import java.util.UUID;
 
 @RestController
@@ -28,11 +30,14 @@ public class EventController {
     private final IngestService ingest;
     private final EventRepository events;
     private final DeliveryRepository deliveries;
+    private final IngestMetrics metrics;
 
-    public EventController(IngestService ingest, EventRepository events, DeliveryRepository deliveries) {
+    public EventController(IngestService ingest, EventRepository events,
+                           DeliveryRepository deliveries, IngestMetrics metrics) {
         this.ingest = ingest;
         this.events = events;
         this.deliveries = deliveries;
+        this.metrics = metrics;
     }
 
     /**
@@ -51,8 +56,23 @@ public class EventController {
             @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
             @RequestBody IngestEventRequest request) {
 
-        IngestResult result = ingest.ingest(
-                tenantId, idempotencyKey, request.eventType(), request.payload());
+        long startedNanos = System.nanoTime();
+        IngestResult result;
+        try {
+            result = ingest.ingest(tenantId, idempotencyKey, request.eventType(), request.payload());
+        } catch (ApiException e) {
+            metrics.recordIngest(
+                    e.getStatus() == HttpStatus.CONFLICT
+                            ? IngestMetrics.RESULT_CONFLICT
+                            : IngestMetrics.RESULT_REJECTED,
+                    Duration.ofNanos(System.nanoTime() - startedNanos), 0);
+            throw e;
+        }
+
+        metrics.recordIngest(
+                result.created() ? IngestMetrics.RESULT_ACCEPTED : IngestMetrics.RESULT_DUPLICATE,
+                Duration.ofNanos(System.nanoTime() - startedNanos),
+                result.created() ? result.deliveriesCreated() : 0);
 
         HttpStatus status = result.created() ? HttpStatus.ACCEPTED : HttpStatus.OK;
         return ResponseEntity.status(status)

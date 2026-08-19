@@ -1,6 +1,6 @@
 # HookRelay — Reference
 
-Current as of **phase 5**. Sections for the Kubernetes topology arrive with the phases that build
+Current as of **phase 6**. Sections for the Kubernetes topology arrive with the phases that build
 them.
 
 ---
@@ -11,8 +11,16 @@ them.
 docker compose up -d
 ```
 
-Starts PostgreSQL and RabbitMQ. The RabbitMQ management UI is at http://localhost:15672
-(guest/guest) — useful for watching `deliveries` fill up while nothing consumes it yet.
+Starts PostgreSQL, RabbitMQ, Prometheus and Grafana.
+
+| | |
+|---|---|
+| RabbitMQ management | http://localhost:15672 (guest/guest) |
+| Prometheus | http://localhost:9090 |
+| Grafana | http://localhost:3000 (anonymous viewer, or admin/admin) |
+
+Prometheus scrapes the API and worker on the **host**, so run them locally with
+`spring-boot:run`; the compose file maps `host.docker.internal` for that.
 
 ```bash
 JAVA_HOME=$(/usr/libexec/java_home -v 21) mvn -pl common,api spring-boot:run -pl api
@@ -133,7 +141,7 @@ Liveness and readiness probes are enabled at `/actuator/health/liveness` and
 | `hookrelay.outbox.publisher.confirm-timeout-ms` | `5000` | |
 | `hookrelay.outbox.purge.enabled` | `true` | Gates the schedule only; the bean and `purgeNow` always exist. |
 | `hookrelay.outbox.purge.retention-hours` | `24` | How long published rows are kept for diagnosis. |
-| `server.port` | `8080` | |
+| `server.port` | `8080` (api), `8081` (worker) | The worker serves only its management endpoints — Prometheus scrapes rather than being pushed to, and phase 7's probes need the same server. |
 
 ---
 
@@ -433,12 +441,64 @@ Constraints that encode a rule rather than trusting code:
 
 ## Metrics
 
-Exposed on `/actuator/prometheus` from phase 6; registered now.
+Scraped from `/actuator/prometheus` on both services — the API on `:8080`, the worker on `:8081`.
 
-| Metric | Meaning |
-|---|---|
-| `hookrelay_outbox_lag_seconds` | Age of the oldest unpublished outbox row. The number that reveals a wedged publisher — counters of events accepted and messages published both look healthy while a backlog grows. |
-| `hookrelay_outbox_published_total` | Outbox rows confirmed by the broker. |
+```bash
+docker compose up -d
+```
+
+Prometheus at http://localhost:9090, Grafana at http://localhost:3000 (anonymous viewer, or
+admin/admin). The dashboard is provisioned from `infra/grafana/dashboards/hookrelay.json`.
+
+### Worker
+
+| Metric | Type | Labels | Answers |
+|---|---|---|---|
+| `hookrelay_deliveries_total` | counter | `result` | Are we delivering? What is the success rate? |
+| `hookrelay_delivery_duration_seconds` | histogram | — | How slow are customer endpoints? |
+| `hookrelay_end_to_end_latency_seconds` | histogram | — | **The real SLO** — accepted until delivered |
+| `hookrelay_attempts_total` | counter | `attempt_no` | How much capacity is going into retries? |
+| `hookrelay_attempt_failures_total` | counter | `error_class` | Timeout? 5xx? Breaker? Capacity? |
+| `hookrelay_dlq_total` | counter | `reason` | What are we giving up on, and why? |
+| `hookrelay_deferrals_total` | counter | — | Are endpoints hitting their concurrency caps? |
+| `hookrelay_circuit_breakers` | gauge | `state` | How many endpoints are being shed? |
+| `hookrelay_worker_inflight` | gauge | — | Saturated, or idle and blocked? |
+| `hookrelay_queue_depth` | gauge | `queue` | Are we falling behind? |
+
+### API
+
+| Metric | Type | Labels | Answers |
+|---|---|---|---|
+| `hookrelay_ingest_latency_seconds` | histogram | — | Is accepting events fast? |
+| `hookrelay_events_total` | counter | `result` | Accepted, duplicate, conflict or rejected? |
+| `hookrelay_fanout_deliveries_total` | counter | — | Deliveries created per event |
+| `hookrelay_outbox_lag_seconds` | gauge | — | Age of the oldest unpublished outbox row — the number that reveals a wedged publisher while every counter still looks healthy. |
+| `hookrelay_outbox_published_total` | counter | — | Outbox rows confirmed by the broker. |
+
+### Two different latencies
+
+`delivery_duration` is one HTTP attempt. `end_to_end_latency` is accepted (202) until delivered. A
+delivery that fails seven times over four hours and succeeds on the eighth in 40 ms has an excellent
+attempt duration and a terrible end-to-end latency — only the second reflects what the customer
+experienced, and they carry different bucket ranges for that reason.
+
+### The cardinality rule
+
+**No metric carries `endpoint_id`, `delivery_id`, `event_id` or `tenant_id`.** Every label above has
+a small fixed value space. Measured cost of breaking it: 3 series → 150 for 50 endpoints,
+extrapolating to **30 000 series and 2.9 MB per scrape** at 10 000 endpoints, from one counter —
+see [RESULTS.md](RESULTS.md#62-what-does-one-high-cardinality-label-cost).
+
+Those identifiers go to the **structured logs** instead, where cardinality is free. The worker puts
+`delivery_id`, `event_id` and `endpoint_id` into MDC for the duration of processing, so every log
+line emitted during a delivery carries them. Metrics answer *how much and how bad*; logs answer
+*which one*.
+
+Structured JSON logging is off by default (readable lines locally) and enabled with:
+
+```bash
+--logging.structured.format.console=ecs
+```
 
 ---
 

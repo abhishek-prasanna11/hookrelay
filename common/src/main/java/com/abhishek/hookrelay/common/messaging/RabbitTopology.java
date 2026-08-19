@@ -10,6 +10,7 @@ import org.springframework.amqp.core.ExchangeBuilder;
 import org.springframework.amqp.core.Queue;
 import org.springframework.amqp.core.QueueBuilder;
 import org.springframework.amqp.rabbit.connection.ConnectionFactory;
+import org.springframework.amqp.rabbit.core.RabbitAdmin;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.amqp.support.converter.Jackson2JsonMessageConverter;
 import org.springframework.amqp.support.converter.MessageConverter;
@@ -168,6 +169,21 @@ public class RabbitTopology {
     @Bean
     public Binding dlqBinding(Queue dlqQueue, DirectExchange dlqExchange) {
         return BindingBuilder.bind(dlqQueue).to(dlqExchange).with(DLQ_ROUTING_KEY);
+    }
+
+    /**
+     * Declared explicitly rather than relying on auto-configuration.
+     *
+     * <p>Spring Boot's {@code RabbitAutoConfiguration} declares this bean with the return type
+     * {@code AmqpAdmin}, so injecting it as a {@code RabbitAdmin} only resolves once something else
+     * has already instantiated it — which made it work everywhere until a bean needed it during
+     * startup, and then failed with "no qualifying bean of type RabbitAdmin". Declaring the concrete
+     * type here removes the ordering dependency; the auto-configured bean backs off on
+     * {@code @ConditionalOnMissingBean}.
+     */
+    @Bean
+    public RabbitAdmin rabbitAdmin(ConnectionFactory connectionFactory) {
+        return new RabbitAdmin(connectionFactory);
     }
 
     @Bean
