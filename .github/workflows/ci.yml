@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          # Caches ~/.m2 between runs. The image build has its own BuildKit cache mount; this one is
+          # for the test job, which does not go through Docker.
+          cache: maven
+
+      # The suite starts real PostgreSQL and RabbitMQ containers via Testcontainers. That works here
+      # because GitHub-hosted runners ship a Docker daemon — and it is the reason these tests are
+      # worth running in CI at all. A suite that substituted an in-memory database would be testing a
+      # different system than the one that ships.
+      - name: Run tests
+        run: mvn -B verify
+
+      - name: Verify the reference receiver against the golden vector
+        # The Python receiver implements signature verification independently of the Java code. Both
+        # are pinned to the same golden vector, so this catches the two drifting apart.
+        run: python3 tools/webhook_receiver.py --selftest
+
+  images:
+    name: Build and publish images
+    runs-on: ubuntu-latest
+    # The gate: an image can never be published from a commit whose tests failed.
+    needs: test
+    permissions:
+      contents: read
+      # Not granted by default — the default token is read-only for packages, which produces a
+      # confusing 403 on the first push.
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        # Only on the default branch: a pull request from a fork must be able to build without
+        # holding credentials that can publish.
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push api
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/docker/Dockerfile
+          target: api
+          # Pull requests build but do not publish, so a broken Dockerfile still fails the PR.
+          push: ${{ github.ref == 'refs/heads/main' }}
+          # Tagged by commit SHA. `latest` is a convenience pointer and is never what a deployment
+          # references: it means something different tomorrow, so it cannot express "the thing we
+          # tested". See docs/phase09-cicd.md §1.2.
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/hookrelay-api:sha-${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/hookrelay-api:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push worker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/docker/Dockerfile
+          target: worker
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/hookrelay-worker:sha-${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/hookrelay-worker:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          echo "### Images" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`hookrelay-api:sha-${GITHUB_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`hookrelay-worker:sha-${GITHUB_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "Deployment is not performed from this workflow — the target cluster is a local" >> "$GITHUB_STEP_SUMMARY"
+          echo "minikube, unreachable from GitHub-hosted runners. See docs/phase09-cicd.md §1.5." >> "$GITHUB_STEP_SUMMARY"
