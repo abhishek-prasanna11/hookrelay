@@ -652,11 +652,158 @@ than a fixed duration. That is not done here.
 
 ---
 
+## Phase 9 — CI/CD
+
+### 9.1 Pipeline
+
+`.github/workflows/ci.yml` runs on every push and pull request:
+
+```text
+   job: test      JDK 21, full Testcontainers suite, plus the Python receiver's golden-vector selftest
+   job: images    needs: test — builds both targets, pushes to GHCR tagged sha-<commit>
+```
+
+Images are tagged by commit SHA; `latest` is a convenience pointer and is never what a deployment
+references, because it means something different tomorrow and so cannot express "the artifact we
+tested".
+
+**The pipeline stops at the registry, deliberately.** GitHub-hosted runners cannot reach a minikube
+cluster on this laptop, so deployment is a local script. Closing that gap needs a self-hosted runner,
+a reachable API server with a kubeconfig secret, or a pull-based deployer — and Argo CD is an explicit
+non-goal (BLUEPRINT.md §2). A `deploy` job that could never run would be worse than the admission.
+
+---
+
+### 9.2 A broken deployment under load — BLUEPRINT.md §26
+
+**Question.** What does deploying a broken version cost, and what actually protects against it?
+
+**Workload.** Continuous load; mid-flight, deploy a version that starts normally but points its
+datasource at a nonexistent host, so the process runs and readiness never passes. Chosen because a
+crash-looping container is the easy case — a process that is up and useless is the one that reaches
+production.
+
+| Measurement | Value |
+|---|---:|
+| Requests sent during the bad deployment | **8 183** |
+| **Requests failed** | **0** |
+| Ingest p50 / p95 / p99 | 51.4 / 299.6 / 682.5 ms |
+| `kubectl rollout status` exit code | **1** — did not complete |
+| Rollout stalled before intervention | **46 s** |
+| Ready replicas throughout | **2** — old version kept serving |
+| Broken pods admitted to the Service | **0** |
+| Recovery after `rollout undo` | **2 s** |
+| Events accepted / deliveries succeeded | 8 183 / **8 183** |
+
+**Interpretation.** The rollback is the least important part. Safety came from the **readiness
+probe** never admitting the broken pods to the Service, and `maxUnavailable: 0` forbidding removal of
+a healthy pod before a new one was Ready — so capacity never dropped and the rollout simply refused
+to finish. A deployment that cannot become Ready is not an outage; it is a deployment that did not
+happen. `rollout undo` took 2 seconds and was cleanup.
+
+The non-zero exit from `rollout status` is the interface a CD job gates on, which is why the number
+worth quoting is the 46 seconds of *safe* stall rather than any recovery time.
+
+**Reproduce:**
+
+```bash
+./chaos/rollback.sh
+```
+
+---
+
+## Phase 10 — Chaos: the four required demonstrations
+
+BLUEPRINT.md §28 requires four failure scenarios. All four are measured; two were run in this phase
+and two in earlier ones.
+
+### 10.1 Worker crash — §28.1
+
+**Workload.** Three workers under load. One deleted gracefully (SIGTERM, grace period), then a
+*different* one force-killed (`--force --grace-period=0`, SIGKILL, no shutdown hook).
+
+| Measurement | Value |
+|---|---:|
+| Requests sent / failed | 2 866 / **0** |
+| Deliveries created | 2 866 |
+| **Deliveries succeeded** | **2 866** |
+| **Deliveries unfinished** | **0** |
+| Total attempts | **2 867** — one more than deliveries |
+| Receiver verified / rejected | 7 145 / **0** |
+
+**Interpretation.** Nothing lost across a graceful kill and a SIGKILL. The single extra attempt *is*
+the redelivery: one delivery was in flight when its worker died, the broker never got an
+acknowledgement, another worker took it. Manual acknowledgement, visible as a difference of one.
+
+```bash
+./chaos/worker-crash.sh
+```
+
+### 10.2 Destination permanently down — §28.2
+
+**Workload.** Receiver answering 500 to everything; the delivery fast-forwarded to the end of the
+ladder rather than waiting 4h42m.
+
+| Measurement | Value |
+|---|---|
+| After attempt 1 | `FAILED`, `last_error = HTTP 500`, retry queued, `next_attempt_at` set |
+| **Final status** | **`DEAD`** |
+| **Final attempt count** | **8** — the cap |
+| Attempt response codes | `500,500` |
+| **DLQ depth before / after** | **0 → 1** |
+
+Bounded retries, a terminal state, a dead-lettered message carrying its reason.
+
+```bash
+./chaos/destination-down.sh
+```
+
+### 10.3 Rolling deployment — §28.3
+
+Phase 7: **13 237 requests across four rolling restarts, 0 dropped, 0 deliveries lost** — see §7.3.
+
+### 10.4 Traffic spike — §28.4
+
+Phase 8: a **73 228-message backlog** absorbed with no loss; queue-depth scaling **2 → 6** where CPU
+never moved off 2 — see §8.1–8.2.
+
+---
+
+### 10.5 A probe that manufactured the outage it was watching for
+
+The first clean run of §10.1 reported **824 deliveries stranded in `PENDING`**, `attempt_count = 0`,
+outbox rows published, all queues empty — the exact signature of the phase 7 silent-loss bug, which
+had already been fixed and regression-tested.
+
+It was not the application. **RabbitMQ restarted three times during the run.** Its liveness probe ran
+`rabbitmq-diagnostics ping` with a 15s timeout every 30s; under a large backlog on a contended node
+that command takes longer, so the kubelet killed a broker that was *busy, not broken*, and queued
+messages went with it.
+
+| | before | after relaxing the probe |
+|---|---:|---:|
+| RabbitMQ restarts during the run | **3** | **0** |
+| Deliveries stranded | **824** | **0** |
+| Deliveries succeeded | 625 of 1 451 | **2 866 of 2 866** |
+
+Probe relaxed to a 30s timeout, 60s period, `failureThreshold: 5`.
+
+**The load generator reported 0 failed requests in the run that lost 824 deliveries.** Any experiment
+asserting "no errors" would have passed and published a false result — which is why every scenario
+asserts on durable state instead:
+
+```sql
+SELECT count(*) FROM deliveries d JOIN events e ON e.id = d.event_id
+ WHERE e.tenant_id = ? AND d.status NOT IN ('SUCCEEDED', 'DEAD');   -- must be 0
+```
+
+---
+
 ## Not yet measured
 
 Listed so their absence is explicit rather than an oversight.
 
 | Result | Phase |
 |---|---|
-| CI/CD pipeline duration; image size; rollback time | 9 |
-| Worker crash: events accepted / lost / redelivered / DLQ | 10 |
+| Ingest throughput at ~1 000 events/sec on a multi-node cluster | — |
+| Backlog drain time, CPU HPA vs KEDA, with a destination that outscales the workers | — |

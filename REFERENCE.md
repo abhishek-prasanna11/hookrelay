@@ -1,6 +1,6 @@
 # HookRelay — Reference
 
-Current as of **phase 7**. Autoscaling and CI/CD arrive with the phases that build them.
+Current as of **phase 10** — all phases complete.
 
 ---
 
@@ -514,8 +514,12 @@ hookrelay/
 │   ├── kubernetes/   manifests + deploy.sh + smoke.sh
 │   ├── prometheus/   scrape config
 │   └── grafana/      provisioned datasource and dashboard
-├── chaos/      loadgen.py, rolling-deploy.sh
-├── load-tests/ (phase 8)
+├── chaos/      loadgen.py + the failure demonstrations
+│   ├── rolling-deploy.sh     rolling deploy under load
+│   ├── rollback.sh           deploy a broken version, watch readiness refuse it
+│   ├── autoscaling.sh        CPU HPA vs KEDA queue depth
+│   ├── worker-crash.sh       graceful kill + SIGKILL under load
+│   └── destination-down.sh   an endpoint that never succeeds
 └── docs/       phaseNN-*.md — one per phase, written before its code
 ```
 
@@ -574,12 +578,52 @@ kept for multi-node production clusters where the race widens, not on the streng
 
 The worker has no `preStop`: nothing routes traffic to it, so there are no endpoints to propagate.
 
-### Rolling deployment under load
+### Autoscaling
+
+```bash
+kubectl apply -f infra/kubernetes/51-keda.yaml
+```
+
+Scales workers on RabbitMQ queue depth. KEDA creates an ordinary HPA underneath and serves depth
+through the external metrics API — the scaling mechanism is the same as the CPU baseline in
+`50-hpa-cpu.yaml`, only the *signal* differs. Apply one or the other, never both: two controllers
+scaling one Deployment fight.
+
+Measured: under a 1 047-message backlog, CPU-based scaling held at 2 replicas with worker CPU flat at
+**28 millicores** (28% of its request, under a 50% target) while queue-depth scaling went to **6**.
+
+### Failure demonstrations
+
+```bash
+./chaos/worker-crash.sh
+```
+
+```bash
+./chaos/destination-down.sh
+```
+
+```bash
+./chaos/rollback.sh
+```
 
 ```bash
 ./chaos/rolling-deploy.sh with-prestop
 ```
 
 ```bash
-EXTRA_ARGS=',"--no-keepalive"' ./chaos/rolling-deploy.sh without-prestop
+./chaos/autoscaling.sh keda
 ```
+
+Each ends by asserting the delivery contract as a query — every accepted delivery must be `SUCCEEDED`
+or `DEAD` once the system is quiescent. That assertion, not the absence of HTTP errors, is what
+catches work going missing: one run reported 0 failed requests while losing 824 deliveries to a
+broker restart.
+
+### CI
+
+`.github/workflows/ci.yml` runs the full Testcontainers suite and the Python receiver's golden-vector
+selftest on every push, then builds both images and pushes them to GHCR tagged `sha-<commit>`.
+
+**The pipeline stops at the registry.** GitHub-hosted runners cannot reach a local minikube, so
+deployment is `infra/kubernetes/deploy.sh`. Closing that gap needs a self-hosted runner, a reachable
+API server with a kubeconfig secret, or a pull-based deployer — see docs/phase09-cicd.md §1.5.

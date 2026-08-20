@@ -50,9 +50,15 @@ spec:
           livenessProbe:
             exec:
               command: ["rabbitmq-diagnostics", "-q", "ping"]
-            initialDelaySeconds: 40
-            periodSeconds: 30
-            timeoutSeconds: 15
+            initialDelaySeconds: 60
+            periodSeconds: 60
+            # Generous on purpose. `rabbitmq-diagnostics ping` contacts the Erlang node, and under a
+            # large backlog on a contended node it can take many seconds — so a tight probe restarts
+            # a broker that is busy rather than broken. Observed: 3 restarts during a chaos run,
+            # taking queued messages with it. A liveness probe that fires under load manufactures the
+            # outage it is supposed to detect.
+            timeoutSeconds: 30
+            failureThreshold: 5
           resources:
             requests:
               cpu: 100m

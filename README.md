@@ -4,10 +4,11 @@ A webhook delivery platform. You hand it an event once; it guarantees the event 
 subscribed HTTP endpoint — surviving worker crashes, dead destinations, slow destinations,
 duplicate submissions, its own redeployments, and traffic spikes.
 
-**Status: phases 1-8 of 10 complete.** Ingest API, durable event store, transactional outbox,
+**Status: all 10 phases complete.** Ingest API, durable event store, transactional outbox,
 RabbitMQ publishing, a worker performing real signed HTTP delivery, bounded exponential retries with
 a dead-letter queue, per-endpoint isolation with SSRF protection, Prometheus/Grafana observability,
-a Kubernetes deployment, and queue-depth autoscaling are built and tested. CI/CD is phase 9.
+a Kubernetes deployment, queue-depth autoscaling, CI/CD and the four chaos demonstrations are built,
+tested and measured.
 
 ---
 
@@ -122,6 +123,11 @@ Measured: a healthy endpoint's p50 went from **12 644 ms to 72 ms** with a slow 
 resolve to `127.0.0.1`. DNS rebinding is narrowed rather than closed, and the residual gap is
 documented rather than glossed.
 
+**A broken deployment costs nothing, and the rollback is not why.** Deploying a version that starts
+but never becomes Ready dropped **0 of 8 183 requests**: the readiness probe never admitted it to the
+Service and `maxUnavailable: 0` kept the old version at full capacity, so the rollout simply stalled.
+`rollout undo` took 2 seconds and was cleanup, not rescue.
+
 **Queue depth, not CPU, drives worker autoscaling.** A delivery worker waits on customer endpoints,
 and a thread waiting on a socket burns no CPU — so under a 1 047-message backlog worker CPU sat flat
 at **28 millicores** against a 100m request, well under a deliberately aggressive 50% target, and the
@@ -169,6 +175,9 @@ millisecond timestamp, so inserts append to the index's right edge while staying
 | Worker replicas under the same workload — KEDA queue depth | **6** |
 | Ingest throughput / fan-out / deliveries created | **268 events/s** × 3.00 = **~805 deliveries/s** |
 | Ingest p50 / p95 / p99 | **9.7 / 94.9 / 192.3 ms** |
+| Requests failed while a **broken version** was deployed under load | **0 of 8 183** |
+| Deliveries lost to a graceful kill **and** a SIGKILL of live workers | **0 of 2 866** |
+| Destination down forever: attempts before `DEAD` + DLQ | **8** (the cap) |
 
 Full detail, with commands to reproduce: [RESULTS.md](RESULTS.md).
 
@@ -209,8 +218,8 @@ no local database or broker is needed. Full command reference: [REFERENCE.md](RE
 | 6 | Observability | done |
 | 7 | Docker + Kubernetes | done |
 | 8 | KEDA + load testing | done |
-| 9 | CI/CD | |
-| 10 | Chaos + results | |
+| 9 | CI/CD | done |
+| 10 | Chaos + results | done |
 
 Each phase has a learning document in [docs/](docs/), written **before** that phase's code:
 concepts → problem → design options → chosen design → implementation → experiment → failures →
