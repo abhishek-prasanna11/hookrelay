@@ -4,10 +4,10 @@ A webhook delivery platform. You hand it an event once; it guarantees the event 
 subscribed HTTP endpoint — surviving worker crashes, dead destinations, slow destinations,
 duplicate submissions, its own redeployments, and traffic spikes.
 
-**Status: phases 1-6 of 10 complete.** Ingest API, durable event store, transactional outbox,
+**Status: phases 1-7 of 10 complete.** Ingest API, durable event store, transactional outbox,
 RabbitMQ publishing, a worker performing real signed HTTP delivery, bounded exponential retries with
-a dead-letter queue, per-endpoint isolation with SSRF protection, and Prometheus/Grafana
-observability are built and tested. Containers and Kubernetes start in phase 7.
+a dead-letter queue, per-endpoint isolation with SSRF protection, Prometheus/Grafana observability,
+and a Kubernetes deployment are built and tested. Autoscaling starts in phase 8.
 
 ---
 
@@ -138,7 +138,7 @@ millisecond timestamp, so inserts append to the index's right edge while staying
 
 | Result | Value |
 |---|---|
-| Test suite | 181 tests, 0 failures |
+| Test suite | 185 tests, 0 failures |
 | Duplicate events under 20 concurrent identical submissions — app-level check | **16** |
 | Duplicate events under 20 concurrent identical submissions — DB constraint | **1** |
 | Deliveries lost to a crash between commit and publish — direct publish | **10 of 10** |
@@ -155,6 +155,10 @@ millisecond timestamp, so inserts append to the index's right edge while staying
 | Healthy endpoint p99 — isolated (one in-flight slow request) | **2 067 ms** |
 | Series from `deliveries_total{result}` at 10 000 endpoints | **3** (232 B/scrape) |
 | Series if labelled by `endpoint_id` as well | **30 000** (2.9 MB/scrape) |
+| Requests dropped across 4 rolling deployments under load | **0 of 13 237** |
+| Deliveries lost across those rollouts | **0 of 13 237** |
+| Deliveries stranded by unconfirmed retry publishes — before / after fix | **3 of 1 578** / **0 of 5 987** |
+| Build + deploy time, uncached / cached | 33 min / **60 s** |
 
 Full detail, with commands to reproduce: [RESULTS.md](RESULTS.md).
 
@@ -193,7 +197,7 @@ no local database or broker is needed. Full command reference: [REFERENCE.md](RE
 | 4 | Retry + DLQ | done |
 | 5 | Isolation + security | done |
 | 6 | Observability | done |
-| 7 | Docker + Kubernetes | |
+| 7 | Docker + Kubernetes | done |
 | 8 | KEDA + load testing | |
 | 9 | CI/CD | |
 | 10 | Chaos + results | |

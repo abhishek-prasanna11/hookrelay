@@ -1,0 +1,86 @@
+# No Service: the worker serves no application traffic. It pulls work from RabbitMQ, and its only
+# HTTP endpoints are the probes and the Prometheus scrape.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: hookrelay
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Unlike the API, losing a worker briefly costs nothing: the broker holds unacknowledged
+      # messages and redelivers them. Phase 3 measured zero deliveries lost across both crash
+      # windows, so there is no capacity guarantee to protect here.
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: /actuator/prometheus
+    spec:
+      # Longer than the API's: a delivery in flight can take up to the 15s request timeout, and the
+      # listener container is given 30s to finish what it holds.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        # Numeric, and matching the image's USER. runAsNonRoot alone cannot verify a username.
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+        - name: worker
+          image: hookrelay-worker:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8081
+          envFrom:
+            - configMapRef:
+                name: hookrelay-config
+            - secretRef:
+                name: hookrelay-secrets
+          env:
+            # No preStop hook here — there are no Service endpoints to propagate, because nothing
+            # routes traffic to a worker. Its shutdown concern is finishing in-flight deliveries,
+            # which is what this bounds.
+            - name: SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE
+              value: 30s
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8081
+            # 5s x 60 = 300s. A JVM takes ~30s to initialise its context on an idle machine, and
+            # far longer when several start at once on a contended node — measured here as repeated
+            # kills at a 90s budget, with the pod never getting to finish booting. The startup probe
+            # is exactly the mechanism for "slow to start but not broken", so it should be generous:
+            # nothing is lost by waiting, because liveness does not run until it succeeds.
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8081
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8081
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests:
+              # Deliberately small. The worker is I/O-bound: it spends its time waiting on customer
+              # endpoints, not computing. That observation is what phase 8's autoscaling experiment
+              # is built on — CPU stays near idle while the queue grows.
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              memory: 768Mi

@@ -458,13 +458,107 @@ JAVA_HOME=$(/usr/libexec/java_home -v 21) mvn -pl common,worker -Dtest=Cardinali
 
 ---
 
+## Phase 7 — Containers and Kubernetes
+
+Run on minikube v1.38.1 (single node, 10 CPU / 12 GB allocatable), Kubernetes client v1.36.0.
+
+### 7.1 Images and build
+
+| Measurement | Value |
+|---|---:|
+| `hookrelay-api:dev` | **270 MB** |
+| `hookrelay-worker:dev` | **268 MB** |
+| Build + deploy, first run — separate Dockerfiles, no cache | **~33 min** |
+| Build + deploy, cached — shared builder + BuildKit `~/.m2` cache mount | **60 s** |
+
+The two original Dockerfiles each ran `dependency:go-offline` with a different `-pl` list, so Docker
+saw different commands and the entire dependency tree downloaded twice.
+
+### 7.2 Smoke test
+
+```bash
+./infra/kubernetes/smoke.sh
+```
+
+Registers an endpoint pointing at the in-cluster receiver, publishes an event, waits for delivery,
+and checks the receiver's counters. The receiver verifies HMAC signatures independently, so this also
+proves the signing contract end to end inside the cluster:
+
+```
+{"received": 1, "verified": 1, "rejected": 0, "duplicates": 0}
+SMOKE PASSED
+```
+
+---
+
+### 7.3 Rolling deployment under load — BLUEPRINT.md §28.3
+
+**Question.** What does a rolling deployment cost in dropped requests and lost deliveries, and does
+the `preStop` hook measurably help?
+
+**Workload.** A load generator pod inside the cluster drives the `api` Service for 70 s; 15 s in,
+both Deployments are rolling-restarted underneath it. Every request carries a unique
+`Idempotency-Key`, so a failure is real rather than a deduplicated retry. Afterwards the database is
+queried for deliveries that never reached a terminal state.
+
+| | with `preStop` | without `preStop` |
+|---|---:|---:|
+| **Keep-alive** — sent / failed | 2 367 / **0** | 3 620 / **0** |
+| **Connection per request** — sent / failed | 3 713 / **0** | 3 537 / **0** |
+| Rollout duration | 78–103 s | 84–99 s |
+
+Across all four arms: **13 237 requests, 0 failed. 13 237 deliveries created, 13 237 succeeded, 0
+lost, 0 dead.**
+
+**Interpretation — this is a null result for `preStop`, not a validation.** The hook covers the
+endpoint-propagation race (docs/phase07-kubernetes.md §1.6), and the experiment **did not reproduce
+that race at all**: the baseline without the hook was equally clean. The first run used keep-alive,
+which was a fair objection since the race affects *new* connections; both arms were re-run with a
+fresh connection per request, and still measured zero.
+
+The window stays closed here because the cluster is **single-node** (one kube-proxy, one iptables
+table, sub-second propagation), `maxUnavailable: 0` keeps a Ready pod available throughout,
+`server.shutdown: graceful` finishes in-flight requests, and ~50 rps produces few new connections
+inside a sub-second window. The hook is retained as a judgement about multi-node production
+clusters, where the race widens — **not** because this data shows it helping. It costs ~8 s per pod.
+
+---
+
+### 7.4 A silent-loss bug found by the experiment
+
+The **first** run reported 0 failed requests but **3 of 1578 deliveries stranded** in `PENDING`
+permanently — `attempt_count = 0`, outbox row *published*, every queue empty including
+unacknowledged. A message had been published, confirmed, consumed, acknowledged, and the delivery had
+evaporated.
+
+**Cause.** `RetryPublisher`'s defer, retry and dead-letter publishes used `convertAndSend` —
+fire-and-forget, no confirm — and `DeliveryListener` acknowledges the original message the instant
+that returns. A defer publish lost during a worker shutdown left the delivery with no queue message,
+no error, and no way back. The worker's configuration had not even enabled `publisher-confirm-type`.
+
+This violates the contract's first rule: no silent loss of accepted work. The outbox publisher had
+waited for broker confirms since phase 2 for exactly this reason; the discipline was never carried
+across to the component that needed it equally.
+
+**Fix.** All three publishes now wait for a confirm and **throw** on failure, so the listener
+negatively acknowledges and the message is redelivered — a possible duplicate instead of a
+guaranteed loss.
+
+| | before fix | after fix |
+|---|---:|---:|
+| Deliveries stranded in `PENDING` | **3 of 1 578** | **0 of 5 987** |
+
+Pinned by `PublishFailureTest` (4 tests), including one that asserts an unconfirmable publish throws
+rather than returning quietly.
+
+---
+
 ## Not yet measured
 
 Listed so their absence is explicit rather than an oversight.
 
 | Result | Phase |
 |---|---|
-| Rolling deployment under load: dropped requests, lost deliveries | 7 |
 | CPU-based HPA vs KEDA queue-depth scaling | 8 |
 | Ingest throughput and p50/p95/p99 at ~1,000 events/sec | 8 |
 | Events/sec vs deliveries/sec at measured fan-out | 8 |

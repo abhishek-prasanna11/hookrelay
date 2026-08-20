@@ -3,6 +3,9 @@ package com.abhishek.hookrelay.worker.delivery;
 import com.abhishek.hookrelay.common.messaging.DeliveryMessage;
 import com.abhishek.hookrelay.common.messaging.RabbitTopology;
 import com.abhishek.hookrelay.common.retry.RetryTier;
+import org.springframework.amqp.AmqpException;
+import org.springframework.amqp.core.MessagePostProcessor;
+import org.springframework.beans.factory.annotation.Value;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.amqp.core.MessageDeliveryMode;
@@ -37,9 +40,12 @@ public class RetryPublisher {
     public static final String REASON_PERMANENT_FAILURE = "permanent_failure";
 
     private final RabbitTemplate rabbit;
+    private final long confirmTimeoutMs;
 
-    public RetryPublisher(RabbitTemplate rabbit) {
+    public RetryPublisher(RabbitTemplate rabbit,
+                          @Value("${hookrelay.publish.confirm-timeout-ms:5000}") long confirmTimeoutMs) {
         this.rabbit = rabbit;
+        this.confirmTimeoutMs = confirmTimeoutMs;
     }
 
     /**
@@ -48,8 +54,7 @@ public class RetryPublisher {
      * {@code deliveries}.
      */
     public void scheduleRetry(UUID deliveryId, RetryTier tier, long delayMillis) {
-        rabbit.convertAndSend(RabbitTopology.RETRY_EXCHANGE, tier.queueName(),
-                new DeliveryMessage(deliveryId),
+        publishConfirmed(RabbitTopology.RETRY_EXCHANGE, tier.queueName(), deliveryId,
                 message -> {
                     message.getMessageProperties().setExpiration(Long.toString(delayMillis));
                     message.getMessageProperties().setDeliveryMode(MessageDeliveryMode.PERSISTENT);
@@ -66,8 +71,7 @@ public class RetryPublisher {
      * permanently saturated would otherwise cycle forever.
      */
     public void defer(UUID deliveryId, int previousDeferrals) {
-        rabbit.convertAndSend(RabbitTopology.RETRY_EXCHANGE, RabbitTopology.DEFERRED_QUEUE,
-                new DeliveryMessage(deliveryId),
+        publishConfirmed(RabbitTopology.RETRY_EXCHANGE, RabbitTopology.DEFERRED_QUEUE, deliveryId,
                 message -> {
                     message.getMessageProperties().setDeliveryMode(MessageDeliveryMode.PERSISTENT);
                     message.getMessageProperties().setHeader(HEADER_DEFERRALS, previousDeferrals + 1);
@@ -84,8 +88,7 @@ public class RetryPublisher {
      */
     public void deadLetter(UUID deliveryId, UUID endpointId, String reason,
                            int attempts, String lastError) {
-        rabbit.convertAndSend(RabbitTopology.DLQ_EXCHANGE, RabbitTopology.DLQ_ROUTING_KEY,
-                new DeliveryMessage(deliveryId),
+        publishConfirmed(RabbitTopology.DLQ_EXCHANGE, RabbitTopology.DLQ_ROUTING_KEY, deliveryId,
                 message -> {
                     var properties = message.getMessageProperties();
                     properties.setDeliveryMode(MessageDeliveryMode.PERSISTENT);
@@ -98,5 +101,36 @@ public class RetryPublisher {
                 });
         log.info("delivery {} dead-lettered after {} attempt(s): {} ({})",
                 deliveryId, attempts, reason, lastError);
+    }
+
+    /**
+     * Publishes and <strong>waits for the broker to confirm</strong>, throwing if it does not.
+     *
+     * <p>This is the same rule the outbox publisher follows in phase 2, and not applying it here was
+     * a real bug found by the phase 7 rolling-deploy experiment. The caller acknowledges the original
+     * message immediately after this returns, so a fire-and-forget publish that quietly failed left
+     * the delivery orphaned: the original was acknowledged, the replacement never existed, and the
+     * delivery sat in {@code PENDING} forever with no queue message and no error — a silent loss of
+     * accepted work, which is precisely what BLUEPRINT.md §1 forbids.
+     *
+     * <p>Measured: 3 of 1578 deliveries stranded across one rolling restart before this fix.
+     *
+     * <p>Throwing is what makes it safe. {@code DeliveryListener} catches, negatively acknowledges
+     * with requeue, and the delivery is processed again — at worst producing a duplicate attempt,
+     * which this system tolerates by design and a lost delivery is not.
+     */
+    // Package-private rather than private: PublishFailureTest calls it with a deliberately
+    // unroutable exchange to prove that an unconfirmed publish throws instead of returning quietly.
+    void publishConfirmed(String exchange, String routingKey, UUID deliveryId,
+                                  MessagePostProcessor postProcessor) {
+        Boolean confirmed = rabbit.invoke(operations -> {
+            operations.convertAndSend(exchange, routingKey, new DeliveryMessage(deliveryId), postProcessor);
+            return operations.waitForConfirms(confirmTimeoutMs);
+        });
+
+        if (!Boolean.TRUE.equals(confirmed)) {
+            throw new AmqpException("broker did not confirm publish of delivery " + deliveryId
+                    + " to " + exchange + "/" + routingKey + " within " + confirmTimeoutMs + "ms");
+        }
     }
 }

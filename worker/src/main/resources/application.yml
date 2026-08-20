@@ -23,6 +23,12 @@ spring:
     port: 5672
     username: guest
     password: guest
+    # Required for RetryPublisher.waitForConfirms. Without confirms, a defer/retry/DLQ publish is
+    # fire-and-forget, and the listener acknowledges the original message immediately afterwards —
+    # so a lost publish strands the delivery in PENDING forever. Found by the phase 7 rolling-deploy
+    # experiment: 3 of 1578 deliveries stranded across one rolling restart.
+    publisher-confirm-type: simple
+    publisher-returns: true
     listener:
       simple:
         # The broker holds each message as unacknowledged until the worker says otherwise, so a

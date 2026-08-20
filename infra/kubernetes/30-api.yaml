@@ -1,0 +1,110 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: hookrelay
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # The API must never lose capacity mid-rollout: a new pod becomes ready before an old one is
+      # removed. maxUnavailable > 0 would mean serving the whole load on fewer pods during a deploy.
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /actuator/prometheus
+    spec:
+      # Must exceed the preStop sleep plus however long in-flight requests take to finish, or the
+      # kernel SIGKILLs the process in the middle of the graceful shutdown it was asked to perform.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        # Numeric, and matching the image's USER. runAsNonRoot alone cannot verify a username.
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+        - name: api
+          image: hookrelay-api:dev
+          # The image is built straight into minikube's Docker daemon, so there is nothing to pull.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: hookrelay-config
+            - secretRef:
+                name: hookrelay-secrets
+          env:
+            - name: SERVER_SHUTDOWN
+              value: graceful
+            - name: SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE
+              value: 20s
+          lifecycle:
+            preStop:
+              exec:
+                # Endpoint removal and SIGTERM are independent, concurrent sequences: kube-proxy on
+                # each node updates its iptables rules asynchronously, and nothing waits for it. This
+                # delays SIGTERM long enough for that to propagate while the pod keeps serving
+                # normally. It is a workaround, and it is the standard one — see
+                # docs/phase07-kubernetes.md section 1.6.
+                command: ["sh", "-c", "sleep 8"]
+          startupProbe:
+            # A JVM takes seconds to boot. Without this, liveness would need an initialDelaySeconds
+            # long enough for the worst case, which then delays detection of a real hang forever
+            # after.
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            # 5s x 60 = 300s. A JVM takes ~30s to initialise its context on an idle machine, and
+            # far longer when several start at once on a contended node — measured here as repeated
+            # kills at a 90s budget, with the pod never getting to finish booting. The startup probe
+            # is exactly the mechanism for "slow to start but not broken", so it should be generous:
+            # nothing is lost by waiting, because liveness does not run until it succeeds.
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            # Deliberately the liveness group, which does NOT check the database. A liveness probe
+            # that verifies dependencies turns a database outage into a cluster-wide crash loop.
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              # No CPU limit: CFS throttling shows up as latency spikes with no error, which is
+              # worse than none at all for a latency-sensitive service. Memory is limited because
+              # exceeding it is an OOM kill, not throttling.
+              memory: 768Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: hookrelay
+spec:
+  selector:
+    app: api
+  ports:
+    - port: 8080
+      targetPort: 8080

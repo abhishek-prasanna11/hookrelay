@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hookrelay-config
+  namespace: hookrelay
+data:
+  SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/hookrelay?reWriteBatchedInserts=true
+  SPRING_RABBITMQ_HOST: rabbitmq
+  SPRING_RABBITMQ_PORT: "5672"
+
+  # In-cluster demonstrations point at the receiver Service, whose address is private — exactly what
+  # SsrfGuard refuses. This is the local-development switch documented in phase 5; it must never be
+  # true in a real deployment.
+  HOOKRELAY_SECURITY_ALLOWPRIVATEDESTINATIONS: "true"
+
+  # Structured JSON, because the consumer here is a log collector rather than a human terminal.
+  LOGGING_STRUCTURED_FORMAT_CONSOLE: ecs
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hookrelay-secrets
+  namespace: hookrelay
+type: Opaque
+# stringData rather than data so the values are readable in git-tracked YAML. These are throwaway
+# development credentials.
+#
+# A Secret is base64, NOT encryption — anyone who can read it can read the value, and encryption at
+# rest is a separate cluster-level setting. It is still the right mechanism: credentials stay out of
+# the image and can be rotated without a rebuild. Real credentials would come from a sealed secret,
+# an external secrets operator, or the cloud provider's secret manager — never from a file in the
+# repository.
+stringData:
+  SPRING_DATASOURCE_USERNAME: hookrelay
+  SPRING_DATASOURCE_PASSWORD: hookrelay-dev-password
+  SPRING_RABBITMQ_USERNAME: hookrelay
+  SPRING_RABBITMQ_PASSWORD: hookrelay-dev-password
+  POSTGRES_USER: hookrelay
+  POSTGRES_PASSWORD: hookrelay-dev-password
+  POSTGRES_DB: hookrelay
+  RABBITMQ_DEFAULT_USER: hookrelay
+  RABBITMQ_DEFAULT_PASS: hookrelay-dev-password

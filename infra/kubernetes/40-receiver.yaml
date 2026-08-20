@@ -1,0 +1,63 @@
+# The phase 3 reference receiver, running in-cluster as a destination for demonstrations.
+#
+# It verifies HMAC signatures independently and deduplicates on X-HookRelay-Delivery-Id, so it also
+# serves as a live check that the delivery contract holds end to end.
+# The receiver-script ConfigMap is created by deploy.sh from tools/webhook_receiver.py — there is
+# exactly one copy of the receiver in the repository rather than a duplicate pasted into YAML that
+# would drift from the one the tests use. It is deliberately NOT declared here: an earlier version
+# had a placeholder ConfigMap in this file, and applying it overwrote the real script.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: receiver
+  namespace: hookrelay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: receiver
+  template:
+    metadata:
+      labels:
+        app: receiver
+    spec:
+      containers:
+        - name: receiver
+          image: python:3.12-alpine
+          command: ["python3", "/app/webhook_receiver.py", "--secret", "$(RECEIVER_SECRET)", "--port", "9000"]
+          env:
+            - name: RECEIVER_SECRET
+              value: demo-endpoint-secret
+          ports:
+            - containerPort: 9000
+          volumeMounts:
+            - name: script
+              mountPath: /app
+          readinessProbe:
+            tcpSocket:
+              port: 9000
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: script
+          configMap:
+            name: receiver-script
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: receiver
+  namespace: hookrelay
+spec:
+  selector:
+    app: receiver
+  ports:
+    - port: 9000
+      targetPort: 9000

@@ -1,7 +1,6 @@
 # HookRelay — Reference
 
-Current as of **phase 6**. Sections for the Kubernetes topology arrive with the phases that build
-them.
+Current as of **phase 7**. Autoscaling and CI/CD arrive with the phases that build them.
 
 ---
 
@@ -510,8 +509,77 @@ hookrelay/
 ├── api/        ingest API, runs Flyway, integration tests
 ├── worker/     delivery worker: consumes the queue, signs and POSTs
 ├── tools/      webhook_receiver.py — reference receiver and signature verifier
-├── infra/      docker/ kubernetes/ rabbitmq/ prometheus/   (phases 6-8)
+├── infra/
+│   ├── docker/       one Dockerfile, two targets, shared builder
+│   ├── kubernetes/   manifests + deploy.sh + smoke.sh
+│   ├── prometheus/   scrape config
+│   └── grafana/      provisioned datasource and dashboard
+├── chaos/      loadgen.py, rolling-deploy.sh
 ├── load-tests/ (phase 8)
-├── chaos/      (phase 10)
 └── docs/       phaseNN-*.md — one per phase, written before its code
+```
+
+---
+
+## Kubernetes
+
+```bash
+./infra/kubernetes/deploy.sh
+```
+
+Builds both images into minikube's Docker daemon and applies every manifest. ~60 s warm, and the
+first build is slower because the BuildKit `~/.m2` cache mount starts empty.
+
+```bash
+./infra/kubernetes/smoke.sh
+```
+
+Registers an endpoint at the in-cluster receiver, publishes an event, waits for delivery, and checks
+the receiver verified the signature. Runs `curl` from inside the cluster rather than through
+`port-forward`, which would pin every request to one pod.
+
+| Workload | Replicas | Service | Notes |
+|---|---|---|---|
+| `api` | 2 | yes, `:8080` | `maxUnavailable: 0` — never lose capacity mid-rollout |
+| `worker` | 2 | **no** | `maxUnavailable: 1` — the broker redelivers unacknowledged messages |
+| `postgres` | 1 | yes | `Recreate` strategy: never two pods on one RWO volume |
+| `rabbitmq` | 1 | yes | `Recreate` |
+| `receiver` | 1 | yes, `:9000` | the phase 3 Python receiver, for demonstrations |
+
+### Probes
+
+Liveness on `/actuator/health/liveness`, readiness on `/actuator/health/readiness`, plus a startup
+probe with a **300 s** budget.
+
+**Liveness deliberately does not check the database.** A liveness probe that verifies dependencies
+turns a database outage into a cluster-wide crash loop — liveness asks *"is this process broken?"*,
+readiness asks *"can it serve right now?"*. The startup probe is generous because a too-tight one
+turns slow JVM boot under contention into a self-inflicted crash loop, and it costs nothing: liveness
+does not run until it succeeds.
+
+### Shutdown
+
+| Setting | api | worker |
+|---|---|---|
+| `preStop` sleep | 8 s | — |
+| `server.shutdown` | `graceful` | — |
+| `spring.lifecycle.timeout-per-shutdown-phase` | 20 s | 30 s |
+| `terminationGracePeriodSeconds` | 45 | 60 |
+
+The `preStop` sleep covers the endpoint-propagation race: endpoint removal and SIGTERM are
+independent concurrent sequences, so a pod can receive SIGTERM while some node's kube-proxy still
+routes to it. **Measured across 13 237 requests and four rolling restarts, removing the hook changed
+nothing** — see [RESULTS.md](RESULTS.md#73-rolling-deployment-under-load--blueprintmd-283). It is
+kept for multi-node production clusters where the race widens, not on the strength of that data.
+
+The worker has no `preStop`: nothing routes traffic to it, so there are no endpoints to propagate.
+
+### Rolling deployment under load
+
+```bash
+./chaos/rolling-deploy.sh with-prestop
+```
+
+```bash
+EXTRA_ARGS=',"--no-keepalive"' ./chaos/rolling-deploy.sh without-prestop
 ```
