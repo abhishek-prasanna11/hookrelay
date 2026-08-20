@@ -81,6 +81,10 @@ spec:
               # endpoints, not computing. That observation is what phase 8's autoscaling experiment
               # is built on — CPU stays near idle while the queue grows.
               cpu: 100m
-              memory: 512Mi
+              # 256Mi, not 512Mi. The autoscaling experiment scales this Deployment out, and at
+              # 512Mi a pool of 10 asks for 5GB of workers alone — more than the node has left after
+              # the API, PostgreSQL and RabbitMQ. An oversized request does not make a JVM faster;
+              # it just makes the pool unschedulable at the size the experiment needs.
+              memory: 256Mi
             limits:
-              memory: 768Mi
+              memory: 448Mi

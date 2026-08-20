@@ -4,10 +4,10 @@ A webhook delivery platform. You hand it an event once; it guarantees the event 
 subscribed HTTP endpoint — surviving worker crashes, dead destinations, slow destinations,
 duplicate submissions, its own redeployments, and traffic spikes.
 
-**Status: phases 1-7 of 10 complete.** Ingest API, durable event store, transactional outbox,
+**Status: phases 1-8 of 10 complete.** Ingest API, durable event store, transactional outbox,
 RabbitMQ publishing, a worker performing real signed HTTP delivery, bounded exponential retries with
 a dead-letter queue, per-endpoint isolation with SSRF protection, Prometheus/Grafana observability,
-and a Kubernetes deployment are built and tested. Autoscaling starts in phase 8.
+a Kubernetes deployment, and queue-depth autoscaling are built and tested. CI/CD is phase 9.
 
 ---
 
@@ -122,6 +122,12 @@ Measured: a healthy endpoint's p50 went from **12 644 ms to 72 ms** with a slow 
 resolve to `127.0.0.1`. DNS rebinding is narrowed rather than closed, and the residual gap is
 documented rather than glossed.
 
+**Queue depth, not CPU, drives worker autoscaling.** A delivery worker waits on customer endpoints,
+and a thread waiting on a socket burns no CPU — so under a 1 047-message backlog worker CPU sat flat
+at **28 millicores** against a 100m request, well under a deliberately aggressive 50% target, and the
+HPA never scaled. KEDA, watching the same workload through RabbitMQ queue depth, scaled **2 → 6**.
+CPU utilisation is a *consequence* of how many workers you have; queue depth measures the *cause*.
+
 **Metrics answer "how much and how bad"; logs answer "which one".** `endpoint_id` is the label you
 most want during an incident and the one that destroys a metrics system: measured at **3 series vs
 150** for 50 endpoints, extrapolating to **30 000 series and 2.9 MB per scrape** at 10 000 endpoints,
@@ -159,6 +165,10 @@ millisecond timestamp, so inserts append to the index's right edge while staying
 | Deliveries lost across those rollouts | **0 of 13 237** |
 | Deliveries stranded by unconfirmed retry publishes — before / after fix | **3 of 1 578** / **0 of 5 987** |
 | Build + deploy time, uncached / cached | 33 min / **60 s** |
+| Worker replicas under a 1 047-message backlog — CPU HPA | **2 (never scaled)**, CPU flat at 28m |
+| Worker replicas under the same workload — KEDA queue depth | **6** |
+| Ingest throughput / fan-out / deliveries created | **268 events/s** × 3.00 = **~805 deliveries/s** |
+| Ingest p50 / p95 / p99 | **9.7 / 94.9 / 192.3 ms** |
 
 Full detail, with commands to reproduce: [RESULTS.md](RESULTS.md).
 
@@ -198,7 +208,7 @@ no local database or broker is needed. Full command reference: [REFERENCE.md](RE
 | 5 | Isolation + security | done |
 | 6 | Observability | done |
 | 7 | Docker + Kubernetes | done |
-| 8 | KEDA + load testing | |
+| 8 | KEDA + load testing | done |
 | 9 | CI/CD | |
 | 10 | Chaos + results | |
 

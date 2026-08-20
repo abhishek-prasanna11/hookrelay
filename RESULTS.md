@@ -553,14 +553,110 @@ rather than returning quietly.
 
 ---
 
+## Phase 8 — Autoscaling and load testing
+
+minikube v1.38.1 (single node, 10 CPU / 12 GB), KEDA v2.15.1, metrics-server enabled.
+
+### 8.1 Can CPU see a backlog?
+
+**Question.** Does CPU-based autoscaling react to a delivery backlog, and does queue depth?
+
+**Workload.** A slow endpoint (300 ms per request), three registered endpoints so fan-out is 3, load
+for 5 s. Identical bounds (`min 2`, `max 6`) and identical scaling policies in both arms — KEDA
+creates an ordinary HPA underneath, so only the **signal** differs.
+
+| | CPU HPA | KEDA queue depth |
+|---|---:|---:|
+| Peak queue depth | 1 047 | 2 587 |
+| **Peak worker replicas** | **2 — never scaled** | **6** |
+| Worker CPU (100m request) | **28m, flat** | 71–412m |
+| Events accepted | 355 | 872 |
+| Deliveries created | 1 065 | 2 616 |
+| Average fan-out | 3.00 | 3.00 |
+
+CPU arm time series:
+
+```text
+   elapsed  depth   replicas  cpu(m)     target = 50% of a 100m request
+     0          0      2       28
+    10      1,047      2       28
+    15      1,026      2       28
+    21          4      2       28
+```
+
+**A thousand messages queued and the signal did not move** — 28% of the request, under the 50%
+target, so the autoscaler had nothing to react to.
+
+### 8.2 The stronger case: a more I/O-bound worker
+
+An earlier run with a **1 second** endpoint delay and heavier load:
+
+```text
+   elapsed  depth     replicas  cpu(m)
+     0           0       2       13
+    24      16,204       2       13
+    95      73,228       2       43
+   181      73,618       3       71
+```
+
+**73,000 messages of backlog, CPU at 43 millicores, two replicas for three minutes.** The more time a
+worker spends waiting on a socket, the less CPU says about how much work is waiting.
+
+**Why this is not a tuning problem.** The target was already 50% of a 100m request — 50 millicores,
+stricter than any production setting. Lowering it further scales on noise. The relationship between
+CPU and pending work is weak for I/O-bound services, and a weak relationship cannot be strengthened
+by moving a threshold.
+
+**The feedback loop it creates:** few workers → each modestly loaded → CPU low → no scale-up → few
+workers. CPU utilisation is a *consequence* of how many workers you have. Queue depth measures the
+*cause* — work waiting — and is immune.
+
+### 8.3 Throughput — BLUEPRINT.md §25
+
+Measured separately with a fast endpoint, since throughput and backlog behaviour are different
+questions:
+
+| Measurement | Value |
+|---|---:|
+| Ingest | **268 events/sec** |
+| Average fan-out | **3.00** |
+| Deliveries created | **~805 deliveries/sec** |
+| Ingest p50 / p95 / p99 | **9.7 / 94.9 / 192.3 ms** |
+| Requests failed | 0 of 5 364 |
+
+Reporting a single "throughput" number would hide which side of the system a bottleneck is on, and
+make capacity planning wrong by the fan-out factor.
+
+### 8.4 What this does not show
+
+**Backlog drain time is deliberately not reported.** Two disqualifying reasons:
+
+1. **The arms did not receive identical workloads.** Same load-generator settings, but achieved
+   ingest differed (71 vs 174 events/sec), so KEDA faced 2 587 messages against CPU's 1 047. A
+   drain-time difference across different workloads measures nothing.
+2. **The receiver saturated.** With 6 workers the in-cluster Python receiver became the bottleneck,
+   so drain time reflects the test endpoint's capacity, not the worker pool's.
+
+Doing it properly needs a destination that scales past the worker pool and a fixed event count rather
+than a fixed duration. That is not done here.
+
+**Reproduce:**
+
+```bash
+./chaos/autoscaling.sh cpu
+```
+
+```bash
+./chaos/autoscaling.sh keda
+```
+
+---
+
 ## Not yet measured
 
 Listed so their absence is explicit rather than an oversight.
 
 | Result | Phase |
 |---|---|
-| CPU-based HPA vs KEDA queue-depth scaling | 8 |
-| Ingest throughput and p50/p95/p99 at ~1,000 events/sec | 8 |
-| Events/sec vs deliveries/sec at measured fan-out | 8 |
 | CI/CD pipeline duration; image size; rollback time | 9 |
 | Worker crash: events accepted / lost / redelivered / DLQ | 10 |

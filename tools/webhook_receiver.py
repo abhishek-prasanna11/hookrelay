@@ -29,7 +29,7 @@ import hmac
 import json
 import sys
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SIGNATURE_HEADER = "X-HookRelay-Signature"
 DELIVERY_ID_HEADER = "X-HookRelay-Delivery-Id"
@@ -229,7 +229,12 @@ def main() -> int:
     Handler.fail_with = args.fail_with
     Handler.delay = args.delay
 
-    server = HTTPServer((args.host, args.port), Handler)
+    # ThreadingHTTPServer, not HTTPServer. The plain one handles a single request at a time, so a
+    # receiver told to delay 300ms caps the ENTIRE system at ~3 deliveries/second no matter how many
+    # workers exist — the destination becomes the bottleneck and any throughput or autoscaling
+    # measurement taken against it is measuring this server. Found while the phase 8 autoscaling
+    # experiment reported 693 of 16,092 deliveries completed in 420 seconds.
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"listening on http://{args.host}:{args.port}  (GET / for counters)", flush=True)
     if args.fail_with:
         print(f"responding {args.fail_with} to every webhook", flush=True)

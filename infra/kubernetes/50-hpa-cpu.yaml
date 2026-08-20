@@ -1,0 +1,43 @@
+# The CPU baseline arm.
+#
+# Apply this OR 51-keda.yaml, never both — two controllers scaling one Deployment fight each other.
+#
+# The 50% target is deliberately aggressive: 50% of the worker's 100m request is 50 millicores, a
+# threshold far stricter than anyone would choose in production. If even that does not fire while a
+# backlog builds, the problem is the signal rather than the tuning — which is the entire point of
+# this arm.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: worker-cpu
+  namespace: hookrelay
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # A percentage of the pod's CPU *request*, not of the node. A pod requesting 100m and using
+          # 50m reads as 50% whether the node is idle or saturated.
+          averageUtilization: 50
+  behavior:
+    scaleUp:
+      # Shortened from the default so the arm is not simply waiting out a stabilisation window.
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 30

@@ -58,7 +58,10 @@ spec:
               cpu: 100m
               memory: 256Mi
             limits:
-              memory: 768Mi
+              # Raised after RabbitMQ was OOM-killed 13 times holding a large delivery backlog.
+              # A broker that dies under backlog takes the whole system with it, and its memory need
+              # scales with queue depth — which is exactly what the autoscaling experiment creates.
+              memory: 1280Mi
       volumes:
         - name: data
           persistentVolumeClaim:

@@ -1,0 +1,73 @@
+# The queue-depth arm.
+#
+# KEDA is not an alternative to the HPA — it is an adapter. The ScaledObject below causes KEDA to
+# create and manage an ordinary HorizontalPodAutoscaler against the worker Deployment, and to serve
+# RabbitMQ queue depth through the external metrics API so that HPA can read it. The scaling
+# mechanism is therefore identical to the CPU arm; only the *signal* differs, which is exactly what
+# the experiment isolates.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keda-rabbitmq
+  namespace: hookrelay
+type: Opaque
+stringData:
+  # KEDA's rabbitmq scaler wants a connection string. Development credentials, as everywhere else in
+  # this cluster — see the note in 10-config.yaml.
+  host: amqp://hookrelay:hookrelay-dev-password@rabbitmq.hookrelay.svc.cluster.local:5672/
+
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: rabbitmq-auth
+  namespace: hookrelay
+spec:
+  secretTargetRef:
+    - parameter: host
+      name: keda-rabbitmq
+      key: host
+
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-queue-depth
+  namespace: hookrelay
+spec:
+  scaleTargetRef:
+    name: worker
+  minReplicaCount: 2
+  # Same bounds as the CPU arm, so the comparison is only about the signal. Capped at 6
+  # because a single-node minikube cannot host more; scaling onto a node that cannot hold the
+  # pods measures the node collapsing, not the scaler.
+  maxReplicaCount: 6
+  pollingInterval: 5
+  cooldownPeriod: 60
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 15
+        scaleDown:
+          stabilizationWindowSeconds: 60
+          policies:
+            - type: Percent
+              value: 50
+              periodSeconds: 30
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: amqp
+        queueName: deliveries
+        mode: QueueLength
+        # Messages per replica: "add a replica for every 100 messages waiting". A crude model — it
+        # ignores per-endpoint concurrency caps and how slow each endpoint is — but directionally
+        # right, which CPU is not for I/O-bound work.
+        value: "100"
+      authenticationRef:
+        name: rabbitmq-auth
